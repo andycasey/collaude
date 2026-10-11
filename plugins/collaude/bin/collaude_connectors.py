@@ -349,8 +349,9 @@ def oauth_authorize(client_id: str, client_secret: str, login_hint: str | None =
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if "code=" not in self.path and "error=" not in self.path:
-                self.send_response(404)
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[-1])
+            if query.get("state", [None])[0] != state:  # not this sign-in's redirect: ignore it
+                self.send_response(400)
                 self.end_headers()
                 return
             try:

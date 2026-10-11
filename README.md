@@ -1,55 +1,206 @@
+<div align="center">
+
 # collaude
 
-Shared, searchable team memory for Claude Code.
+### One memory for every Claude you run.
 
-When a collaborator's Claude Code session ends (or is about to compact), a background job reads the new part of the transcript, asks Haiku what a colleague would be glad to know, and stores a few short memories in a PostgreSQL database that the rest of the group can search. Each memory records who, when, and where it came from. The next time anyone in the group opens Claude in a project folder, it's told about the latest memories and can search the rest.
+A Claude Code plugin that gives all your sessions a shared, searchable brain:<br>
+across folders, across machines, and across your team.
+
+</div>
+
+---
+
+Every Claude Code session turns up something worth keeping: a bug's real cause, an approach that failed, a decision and the reason for it. Then the session ends and it's gone. Open Claude in another folder, on your other computer, or hand the project to a colleague, and you start from zero.
+
+**collaude remembers.** As you work, it picks out what's worth knowing later and adds it to a central memory. Every session connected to that memory starts out knowing it, and can search the rest.
+
+```mermaid
+flowchart LR
+    laptop["💻 You, on your laptop"] <--> brain
+    cluster["🖥️ You, on the cluster"] <--> brain
+    folder["📁 You, in another project folder"] <--> brain
+    team["🧑‍🔬 Your collaborators"] <--> brain
+    slack["💬 Slack and mailing lists"] --> brain
+    brain(("🧠 collaude"))
+    style brain fill:#f5e6ff,stroke:#8b5cf6,stroke-width:2px
+```
+
+## One brain, wherever you work
+
+- **Across folders.** The analysis repo, the paper draft and the scratch directory can share one memory. What you learned debugging in one is there when you're writing in another.
+- **Across machines.** Work on your laptop in the morning and on the cluster in the afternoon. Both connect to the same memory, so neither has to be told twice.
+- **Across your team.** Point a group at the memory and your collaborators' sessions draw on it too. Nobody re-runs the dead end you already tried.
+
+A memory belongs to a *group*. A group can be just you, a project, or a whole lab.
+
+## Why collaude
+
+**🪄 Nothing to remember.** No notes to write and no wiki to keep up. collaude runs in the background through Claude Code hooks, and you keep working as usual.
+
+**🔎 Answers, not transcripts.** Each session becomes a few short memories, typically zero to three: findings, dead ends, decisions, methods and gotchas. Search ranks them by relevance and by how recent they are.
+
+**🧾 Every memory can be traced.** A memory records which person, machine and folder it came from, when, the git branch and commit, and a verbatim quote from the conversation behind it. Memories can be corrected or retracted, but nothing is silently deleted.
+
+**🔒 Private by default.** Groups are closed. The database itself enforces who can read what, so another group's memories never reach your session. Type `#offrecord` in any message and that session is never recorded.
+
+**💬 Slack and email too.** Connect your group's channels and mailing lists, and the decisions buried in long threads become searchable memories that link back to the original messages.
+
+**🐘 Runs on plain Postgres.** It needs no extensions and no vendor lock-in. Run it on a laptop, on your own server, or with any hosted Postgres provider.
+
+## How it works
+
+1. **You work.** Use Claude Code as you always do, in any folder linked to a group.
+2. **collaude listens.** When a session ends or compacts, a background job takes the new part of the conversation, redacts secrets, and asks a small model what is worth remembering.
+3. **Every session benefits.** The memories are stored with their provenance. Each new session in the group, on any machine and by anyone in it, starts by seeing the latest memories, and Claude knows to search the rest before it repeats work.
+
+## Get started
+
+You need [uv](https://docs.astral.sh/uv/) and a personal connection string from whoever runs your database. To run the database yourself, see [For admins](#for-admins).
+
+**1. Install the plugin** in Claude Code:
 
 ```
- your laptop                                   any PostgreSQL server
- ┌──────────────────────────────┐              (Supabase, your own, RDS, ...)
- │ Claude Code session          │              ┌─────────────────────────┐
- │   SessionStart hook ─────────┼── recent ───▶│ collaude.memories       │
- │   Stop/PreCompact/SessionEnd │              │ collaude.sessions       │
- │     └─ detached worker       │              │ collaude.excerpts       │
- │          condense + redact   │              │ groups / memberships    │
- │          claude -p (haiku)   │── insert ───▶│ row-level security by   │
- │   team-memory skill ─────────┼── search ───▶│   group membership      │
- └──────────────────────────────┘              └─────────────────────────┘
+/plugin marketplace add andycasey/collaude
+/plugin install collaude@collaude
 ```
 
-## How it meets the requirements
-
-| Requirement | How |
-|---|---|
-| Closed groups, tied to folders | A committed `.collaude.json` (`{"group": "stars"}`) puts a folder in a group. Each person is a real Postgres login role. Row-level security in the database limits every read and write to that person's groups. |
-| Searchable | Postgres full-text search with stemming and weighting (title and tags above body), ranked with a gentle recency decay. |
-| Provenance | Each memory stores its author (taken from the database login, so it can't be forged), the time, a verbatim evidence quote from the transcript (checked to be verbatim), the session ID, host, folder, git remote, branch and commit, and the transcript path. Projects can opt in to uploading a condensed transcript excerpt as well. Changes to a memory's status record who made them and when. Nothing is deleted. |
-| Automatic | Claude Code hooks. You do nothing. Writing `#offrecord` in any message skips that session. |
-| Slack / mailing lists | Connectors pull messages from chosen channels and mail folders, then distil quiet threads into memories that link back to the original messages. Catch-up runs in the background when a session starts on a machine that holds the credentials. See [Connectors](#connectors-slack-and-email). |
-
-## Not tied to Supabase
-
-The memory layer is plain PostgreSQL (version 14 or later). It needs no extensions, no Supabase Auth, and no PostgREST. Clients connect with an ordinary connection string. To move to another server, `pg_dump` the `collaude` schema plus the roles, restore it on the new server, and send people new connection strings.
-
-## Admin: one-time setup
-
-You need [uv](https://docs.astral.sh/uv/) and a Postgres connection string for a role that can create roles and schemas.
+**2. Put the `collaude` command on your path.** Claude Code keeps the plugin at `~/.claude/plugins/marketplaces/collaude`, and the command is a single script inside it that runs itself through uv:
 
 ```sh
-CL=plugins/collaude/bin/collaude.py
-export COLLAUDE_ADMIN_DSN='postgresql://...'      # see below for Supabase
-
-$CL admin migrate                                  # creates the collaude schema (re-run after upgrades)
-$CL admin add-group stars --name "Stellar astrophysics"
-$CL admin add-user alice@flatironinstitute.org --name "Alice" --group stars
-#   -> prints a personal connection string; send it to Alice privately
-$CL admin add-member alice@flatironinstitute.org another-group
-$CL admin remove-member alice@flatironinstitute.org stars
-$CL admin deactivate-user alice@flatironinstitute.org   # revokes login, keeps her memories
-$CL admin list-users
+mkdir -p ~/.local/bin
+ln -sf ~/.claude/plugins/marketplaces/collaude/plugins/collaude/bin/collaude.py ~/.local/bin/collaude
+collaude --help        # if this isn't found, add ~/.local/bin to your PATH
 ```
 
-**Locally (for trying it out or building connectors):**
+The link stays valid when the plugin updates. If you added the marketplace from a local clone instead, link to `plugins/collaude/bin/collaude.py` in that clone.
+
+**3. Connect** to the database. The string is saved to `~/.config/collaude/config.json`, readable only by you.
+
+```sh
+collaude setup --dsn '<your connection string>'
+collaude passwd        # optional: choose your own password
+```
+
+**4. Link a project** to a group, once per project:
+
+```sh
+cd ~/projects/my-project
+collaude init my-group
+git add .collaude.json && git commit -m "Share Claude memories with my-group"
+```
+
+That's it. Sessions in that folder now add to the group's memory and draw on it.
+
+**On another machine,** repeat steps 1 to 3 with the same connection string. Because `.collaude.json` is committed, any clone of the project is already linked. **For another folder,** run `collaude init my-group` there too.
+
+## Use it
+
+Mostly you won't need to: Claude searches the memory on its own when it's relevant. Ask it *"have we looked at this before?"* and it will check. You can also use the command line:
+
+```sh
+collaude search "detection limit"                  # search this project's group
+collaude search "zero point" --all-groups --kind dead_end
+collaude recent -n 20
+collaude show 42                                   # full text and provenance
+collaude add --kind decision --title "..." --body "..."
+collaude retract 42 --reason "bug in the binning"
+collaude status
+```
+
+Memory kinds: `finding`, `dead_end`, `decision`, `method`, `data_note`, `gotcha`, `question`, `other`.
+
+## Bring in Slack and email
+
+Connectors pull messages from the channels and mail folders you choose, wait until a thread has gone quiet, and then distil it into memories that cite the original messages. Everything is set up from the command line, which checks your credentials before it saves anything.
+
+```sh
+collaude connector slack-manifest        # create the Slack app from this manifest
+collaude connector add slack             # paste the bot token, then choose a group for each channel
+collaude connector add email --host imap.example.org --user lists@example.org
+
+collaude connector list                  # what's connected, last sync, any errors
+collaude search --messages "zero point"  # search the raw messages
+```
+
+Catch-up runs in the background whenever someone who holds the credentials starts a Claude session, so no server is needed. A lease in the database makes sure only one machine runs a connector at a time. Re-fetching a message never stores it twice, and a thread or channel that fails never blocks the others.
+
+<details>
+<summary><b>More connector commands</b></summary>
+
+```sh
+# Non-interactive, e.g. for scripts
+collaude connector add slack --secret-env SLACK_BOT_TOKEN --route '#my-channel=my-group'
+collaude connector add email --host ... --user ... --secret-env MAILPW --route 'lists/my-list=my-group'
+
+collaude connector sources slack                         # channels the credentials can see
+collaude connector route slack '#new-channel' my-group --backfill-days 30
+collaude connector unroute slack '#new-channel'
+collaude connector login slack                           # a second person stores credentials too
+collaude connector pause slack / resume slack
+collaude connector remove slack                          # disconnect; ingested memories stay
+collaude ingest                                          # run now instead of at the next session start
+```
+
+Tokens and passwords stay in `~/.config/collaude/secrets.json` on the machine where they were entered. Only the routing (which channel feeds which group) is stored in the database. Only a connector's creator can route it, and only to a group they belong to; any member of a group can unroute a channel from it.
+
+Memories from a connector are credited to the person whose machine ingested them, and `collaude show` lists the original messages with their real authors and links.
+
+The first run fetches 14 days of history (`--backfill-days`). Slack's free plan hides messages older than 90 days, so if your group might go that long without opening Claude, schedule `collaude ingest --stale-after 30 --quiet` with cron or launchd.
+
+</details>
+
+## What leaves your machine
+
+| Where | What |
+|---|---|
+| **Anthropic**, through your own `claude` login | The new part of the session, with secrets redacted and noise removed. Your messages and Claude's replies are kept. Tool calls and their output are clipped short. Thinking, sub-agents and system text are dropped. |
+| **Your group's database** | Only the resulting memories and their provenance. Condensed transcripts are uploaded only if the project turns on `share_excerpts`. |
+
+Redaction catches private keys, common API tokens, and passwords in URLs and config-style assignments. Treat it as a safety net, not a guarantee; `#offrecord` is the reliable switch.
+
+## Configuration
+
+`.collaude.json` sits in the project folder and is committed alongside the code:
+
+```json
+{
+  "group": "my-group",
+  "capture": true,
+  "share_excerpts": false,
+  "recent_on_start": 8,
+  "checkpoint_minutes": 0
+}
+```
+
+| Option | What it does |
+|---|---|
+| `group` | The group this folder belongs to. |
+| `capture` | Set to `false` to read the group's memories here without adding any. |
+| `share_excerpts` | Also upload the condensed, redacted transcript, so collaborators can see the context behind a memory. Off by default. |
+| `recent_on_start` | How many recent memories Claude sees when a session starts. |
+| `checkpoint_minutes` | Also capture a session every this many minutes while it runs. This is useful when sessions stay open for days. `0` (the default) captures only when a session compacts or ends. |
+
+Logs are written to `~/.local/state/collaude/collaude.log`. If the database can't be reached, the capture is retried next time.
+
+## For admins
+
+Give collaude any PostgreSQL 14+ server and a connection string for a role that can create roles and schemas. Each person gets their own database login, and row-level security limits everything they read or write to their own groups.
+
+```sh
+export COLLAUDE_ADMIN_DSN='postgresql://...'
+
+collaude admin migrate                                   # create or upgrade the schema
+collaude admin add-group my-group --name "My research group"
+collaude admin add-user alice@example.org --name "Alice" --group my-group
+#   -> prints Alice's personal connection string; send it to her privately
+collaude admin add-member alice@example.org another-group
+collaude admin remove-member alice@example.org my-group
+collaude admin deactivate-user alice@example.org         # revokes login, keeps her memories
+collaude admin list-users
+```
+
+To try it locally:
 
 ```sh
 brew install postgresql@16 && brew services start postgresql@16
@@ -57,138 +208,27 @@ createdb collaude
 export COLLAUDE_ADMIN_DSN=postgresql://localhost/collaude
 ```
 
-Only your machine can reach it. When you're ready to share, migrate to a server collaborators can reach and send out new connection strings.
+When you're ready to share, run it on a server your collaborators can reach (on your network, over a VPN, or hosted), and use TLS if it's reachable from outside. Moving later is a `pg_dump` of the `collaude` schema and its roles.
 
-**On Supabase:**
-1. Create a project.
-2. Under *Connect*, copy the **Session pooler** connection string. It works over IPv4 and looks like `postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`. Use it as `COLLAUDE_ADMIN_DSN`.
-3. Run `add-user`. When the admin user name carries a `.<ref>` suffix, `add-user` adds the same suffix to each new user's name, which is how Supabase's pooler routes custom roles.
+## Roadmap
 
-Don't add the `collaude` schema to Supabase's exposed API schemas. Nothing here uses the API.
+- **Meaning-based search** with `pgvector`, blended with full-text ranking.
+- **More connectors:** GitHub issues and PRs, arXiv and ADS alerts, document comments. A connector is a small class in `bin/collaude_connectors.py`.
+- **OAuth email login**, for mail domains that don't allow app passwords.
+- **Several groups per folder.** Today a folder belongs to one group, and other groups are reachable with `--all-groups`.
 
-**On your own server:** any reachable Postgres 14+ works, for example inside the institute network, on a VPN, or behind Tailscale. Use TLS (`sslmode=require` or stricter) if it is reachable from outside.
-
-## Collaborators: setup
-
-1. Install [uv](https://docs.astral.sh/uv/).
-2. Install the plugin in Claude Code:
-   ```
-   /plugin marketplace add andycasey/collaude
-   /plugin install collaude@collaude
-   ```
-3. Save your connection string (stored in `~/.config/collaude/config.json`, mode 600):
-   ```sh
-   uv run --script <path-to-plugin>/bin/collaude.py setup --dsn '<the string the admin sent you>'
-   uv run --script <path-to-plugin>/bin/collaude.py passwd     # optional: pick your own password
-   ```
-4. Link a project folder to a group, once per project, and commit the file:
-   ```sh
-   cd ~/projects/clump-rotation
-   uv run --script <path-to-plugin>/bin/collaude.py init stars
-   git add .collaude.json && git commit -m "Share Claude memories with the stars group"
-   ```
-
-Tip: `ln -s <path-to-plugin>/bin/collaude.py ~/.local/bin/collaude` lets you type `collaude search ...`, because the script runs itself through uv.
-
-## Day to day
-
-Nothing changes. Claude sees recent memories when a session starts, and the `team-memory` skill tells it when to search. You can also use the CLI yourself:
-
-```sh
-collaude search "clump rotation detection limit"
-collaude search "gaia zero point" --all-groups --kind dead_end
-collaude recent -n 20
-collaude show 42                 # full provenance
-collaude retract 42 --reason "bug in the binning"
-collaude add --kind decision --title "..." --body "..."
-collaude status
-```
-
-`.collaude.json` options:
-
-```json
-{
-  "group": "stars",
-  "share_excerpts": false,
-  "capture": true,
-  "checkpoint_minutes": 0,
-  "recent_on_start": 8
-}
-```
-
-- `share_excerpts`: also upload the condensed, redacted transcript text for each captured session, so collaborators can see the context behind a memory. It's off by default; when off, transcripts stay on the author's machine.
-- `capture`: set to `false` to read memories in this folder without contributing any.
-- `checkpoint_minutes`: also capture a running session every this many minutes, counted from its first reply. It's `0` (off) by default, so sessions are captured at compaction and when they end. Turn it on for folders where sessions stay open for days. `COLLAUDE_CHECKPOINT_MINUTES` overrides it on your machine.
-- `recent_on_start`: how many recent memories Claude is shown when a session starts.
-
-## Connectors: Slack and email
-
-Connectors are added from the CLI, which asks for what it needs and checks the credentials before saving anything. There are no config files to edit. The non-secret settings (which channel or folder feeds which group) live in the database, so collaborators see them. The token or password stays in `~/.config/collaude/secrets.json` (mode 600) on the machine where you entered it.
-
-```sh
-# Slack: the command prints how to create the app; the manifest sets the scopes for you
-collaude connector slack-manifest            # paste at api.slack.com/apps -> Create New App -> From a manifest
-collaude connector add slack                 # asks for the xoxb- token, then which group each channel feeds
-#   then /invite @collaude in each channel you want to share
-
-# Email: a mailbox subscribed to your lists (for Gmail, use an app password)
-collaude connector add email --host imap.gmail.com --user lists-bot@flatironinstitute.org
-#   asks for the password, then which group each mail folder feeds
-
-# Non-interactive versions, e.g. for scripts
-collaude connector add slack --secret-env SLACK_BOT_TOKEN --route '#clump-rotation=stars'
-collaude connector add email --host ... --user ... --secret-env MAILPW --route 'lists/stars=stars'
-
-collaude connector list                      # what's connected, routes, last sync, errors
-collaude connector sources slack             # channels/folders the credentials can see
-collaude connector route slack '#new-channel' stars [--backfill-days 30]
-collaude connector unroute slack '#new-channel'
-collaude connector login slack               # a second person stores credentials, so either can catch up
-collaude connector pause slack / resume slack
-collaude connector remove slack              # disconnects; what was ingested stays searchable
-collaude ingest                              # run now instead of waiting for the next session start
-collaude search --messages "zero point"      # search the raw messages
-```
-
-**How ingest runs.** When a Claude session starts on a machine that holds a connector's credentials, a background job checks whether that connector ran in the last 30 minutes (`COLLAUDE_INGEST_STALE_MINUTES`). If it didn't, the job runs. A lease row in the database makes sure only one machine runs a given connector at a time. Each run:
-
-1. Fetches new messages since the stored cursor. On the first run it goes back `--backfill-days`, 14 by default. Slack also re-checks the last 7 days for new replies to older threads.
-2. Redacts secrets and stores each message in `collaude.sources`. Re-fetching the same message never creates a duplicate.
-3. Waits until a thread has had no new messages for 2 hours (`--quiet-hours`), then sends it to Haiku together with up to 10 earlier, already-processed messages from the same thread as context. Haiku ignores chatter. Every memory must cite the IDs of the messages it came from; memories that don't are dropped.
-4. Processes at most 200 threads per run (`--max-threads`) and leaves the rest for the next session, so a long gap never turns into one huge run. If extraction fails on a thread three times (for example, Haiku doesn't return JSON), that thread is skipped and logged so it can't hold up the others. A channel or folder that fails to fetch doesn't stop the connector's other channels; the error shows in `collaude connector list`.
-
-If nobody with credentials opens Claude for a while, nothing runs, and the next run catches up from the cursor. One exception: Slack's free plan hides messages older than 90 days. If you might go that long without opening Claude, add a cron or launchd job that runs `collaude ingest --stale-after 30 --quiet`.
-
-**Who can do what.** Only a connector's creator can point it at a group, and only at a group they belong to. Any member of a group can disconnect a channel from that group. Messages and memories are visible only to the group they were routed to. Memories from a connector are attributed to the person whose machine ingested them ("from slack, ingested by Alice"), and `collaude show` lists the original messages with their real authors and links.
-
-## What leaves your machine
-
-When a session in a linked folder ends or compacts (and every `checkpoint_minutes`, if set):
-
-1. **To Anthropic, through your own `claude` login:** the new part of the transcript, with secrets redacted, is sent to Haiku for extraction. Text from user and assistant turns is kept, tool inputs are clipped to 400 characters, tool outputs to 600 characters, and thinking, sub-agents and system reminders are dropped.
-2. **To the database:** only the resulting memories (usually zero to three), each with its provenance metadata. The condensed transcript goes too only if `share_excerpts` is on.
-
-Redaction covers private keys, AWS, GitHub, Slack and `sk-` API keys, passwords in URLs, and `password=` / `token:`-style assignments. It's a safety net and doesn't catch everything; `#offrecord` is the reliable switch.
-
-Logs are written to `~/.local/state/collaude/collaude.log`. If the database is unreachable, the capture is retried at the next compaction or session end.
-
-## Limitations and roadmap
-
-- **More connectors** (GitHub issues and PRs, arXiv or ADS alerts, Google Doc comments): add a class to `bin/collaude_connectors.py` that implements `check`, `list_sources`, `resolve`, and `fetch`, and register it in `KINDS`.
-- **Email login** uses an IMAP password or app password. OAuth (XOAUTH2) isn't implemented, so Google Workspace domains that disable app passwords will need it.
-- **Meaning-based search:** add `pgvector` and an embedding column, and blend it with full-text ranking. The schema change is additive.
-- **One group per folder.** Memories from other groups are still reachable with `--all-groups`.
-- **Extraction quality** depends on the prompt in `prompts/extract.md`. Tune it for your field. Each memory records its `extractor` version, so you can audit old output.
-- **Removing someone from a group** stops their future reads, but can't take back what they have already seen.
+Removing someone from a group stops what they can read from then on, but it can't take back what they've already seen. Extraction quality depends on `prompts/extract.md`, so tune it for your field. Each memory records the extractor version that wrote it.
 
 ## Development
 
 ```sh
-# unit tests only
+# unit tests
 uv run --with pytest --with 'psycopg[binary]' pytest tests
-# full suite against a disposable server (creates and drops its own database and roles)
-COLLAUDE_TEST_ADMIN_DSN=postgresql://postgres:pw@localhost:5432/postgres \
-  uv run --with pytest --with 'psycopg[binary]' pytest tests
-```
 
-To try the plugin without installing it: `claude --plugin-dir plugins/collaude`.
+# full suite against a disposable server (creates and drops its own database and roles)
+COLLAUDE_TEST_ADMIN_DSN=postgresql://localhost/postgres \
+  uv run --with pytest --with 'psycopg[binary]' pytest tests
+
+# try the plugin without installing it
+claude --plugin-dir plugins/collaude
+```

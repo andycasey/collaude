@@ -1159,7 +1159,12 @@ def _renew_lease(conn, cid: str) -> None:
         raise LeaseLost(f"lease on {cid} expired; stopping so another run can take over")
 
 
-def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int) -> tuple[str, str | None]:
+def _silent(msg: str) -> None:
+    pass
+
+
+def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int,
+                     say=_silent) -> tuple[str, str | None]:
     """Fetch every route, then distil. Returns (summary, error); one failing route doesn't stop the rest."""
     impl = _connectors_mod().make(kind, settings, secret)
     routes = conn.execute("""select source_key, source_label, group_id, cursor, backfill_from
@@ -1169,12 +1174,15 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
     fetched, errors = 0, []
     for key, label, group, cursor, backfill in routes:
         _renew_lease(conn, cid)
+        say(f"  fetching {label or key} -> {group} ...")
         try:
             items, new_cursor = impl.fetch(key, cursor, backfill, label)
         except Exception as e:
             conn.rollback()
             errors.append(f"{label or key}: {type(e).__name__}: {e}")
+            say(f"    failed: {type(e).__name__}: {e}")
             continue
+        before = fetched
         for it in items:
             cur = conn.execute("""
                 insert into collaude.sources
@@ -1189,8 +1197,9 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
         conn.execute("""update collaude.connector_routes set cursor = %s, last_synced_at = now()
                         where connector_id = %s and source_key = %s""", (new_cursor, cid, key))
         conn.commit()
+        say(f"    {fetched - before} new of {len(items)} fetched")
     made = distill(conn, cid, impl.origin, float(settings.get("quiet_hours", INGEST_QUIET_HOURS)), max_threads,
-                   renew=lambda: _renew_lease(conn, cid))
+                   renew=lambda: _renew_lease(conn, cid), say=say)
     summary = f"{fetched} new messages, {made} new memories"
     if errors:
         summary += f"; {len(errors)} of {len(routes)} sources failed"
@@ -1211,7 +1220,7 @@ def _render_thread(msgs: list[dict]) -> str:
 
 
 def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, max_chars: int = 60_000,
-            renew=lambda: None) -> int:
+            renew=lambda: None, say=_silent) -> int:
     """Turn threads that have gone quiet into memories, oldest first, at most max_threads per run."""
     from psycopg.rows import dict_row
 
@@ -1238,24 +1247,32 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
     for r in rows:
         threads.setdefault((r["group_id"], r["thread_key"]), []).append(r)
 
-    made = 0
     by_group: dict[str, list[list[dict]]] = {}
     for (group, _), msgs in threads.items():
         by_group.setdefault(group, []).append(msgs)
+    batches: list[tuple[str, list[list[dict]]]] = []  # one extractor call each
     for group, group_threads in by_group.items():
         batch: list[list[dict]] = []
         size = 0
         for msgs in group_threads:
             text = _render_thread(msgs)
             if batch and size + len(text) > max_chars:
-                renew()
-                made += _distill_batch(conn, group, origin, batch)
+                batches.append((group, batch))
                 batch, size = [], 0
             batch.append(msgs)
             size += len(text) + 1
         if batch:
-            renew()
-            made += _distill_batch(conn, group, origin, batch)
+            batches.append((group, batch))
+
+    if batches:
+        say(f"  distilling {len(threads)} quiet threads in {len(batches)} extractor calls ...")
+    made = 0
+    for i, (group, batch) in enumerate(batches, 1):
+        renew()
+        t0 = time.time()
+        n = _distill_batch(conn, group, origin, batch)
+        made += n
+        say(f"    {i}/{len(batches)}: {len(batch)} threads -> {n} memories ({time.time() - t0:.0f} s)")
     return made
 
 
@@ -1318,8 +1335,11 @@ def cmd_ingest(args) -> None:
                     print(f"{cid}: skipped (ran less than {args.stale_after} min ago, or running elsewhere)")
                 continue
             error = None
+            if not args.quiet:
+                print(f"{cid}: ingesting ...", flush=True)
+            say = _silent if args.quiet else lambda msg: print(msg, flush=True)
             try:
-                summary, error = ingest_connector(conn, cid, kind, settings, held[cid], args.max_threads)
+                summary, error = ingest_connector(conn, cid, kind, settings, held[cid], args.max_threads, say)
                 if error:
                     summary += f" ({error})"
             except Exception as e:

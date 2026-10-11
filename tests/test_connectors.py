@@ -366,7 +366,10 @@ def test_slack_end_to_end(db, slack, as_user, monkeypatch, capsys):
         assert "xoxb" not in json.dumps(conn.execute("select settings from collaude.connectors").fetchall())
 
     cl.main(["ingest"])
-    assert "slack: 3 new messages, 1 new memories" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "slack: 3 new messages, 1 new memories" in out
+    assert "fetching #clump-rotation -> g1" in out and "3 new of 3 fetched" in out  # progress as it goes
+    assert "distilling 1 quiet threads in 1 extractor calls" in out and "1/1: 1 threads -> 1 memories" in out
     cl.main(["ingest", "--stale-after", "30"])
     assert "skipped (ran less than 30 min ago" in capsys.readouterr().out
 

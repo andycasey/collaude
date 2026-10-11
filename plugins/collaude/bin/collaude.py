@@ -568,10 +568,12 @@ def capture_worker(args) -> None:
             text = "…[earlier part of session omitted]\n" + text[-MAX_TRANSCRIPT_CHARS:]
 
         try:
+            # Two short connections, so no transaction stays open while the extractor runs.
             with connect() as conn:
                 existing = fetch_recent(conn, [group], 80)
-                raw = run_extractor(build_prompt(text, existing, group))
-                memories = parse_memories(raw, text, {m["id"] for m in existing})
+            raw = run_extractor(build_prompt(text, existing, group))
+            memories = parse_memories(raw, text, {m["id"] for m in existing})
+            with connect() as conn:
                 if memories:
                     insert_session(conn, session_id, group, cwd, transcript_path)
                     if proj.get("share_excerpts"):
@@ -1045,6 +1047,7 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
     routes = conn.execute("""select source_key, source_label, group_id, cursor, backfill_from
                              from collaude.connector_routes where connector_id = %s order by source_key""",
                           (cid,)).fetchall()
+    conn.commit()  # end the read before talking to the remote service
     fetched = 0
     for key, label, group, cursor, backfill in routes:
         items, new_cursor = impl.fetch(key, cursor, backfill, label)
@@ -1100,6 +1103,7 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
             order by s.group_id, p.first_time, s.thread_key, s.source_time""",
             {"c": cid, "quiet": quiet_hours, "n": max_threads})
         rows = cur.fetchall()
+    conn.commit()
 
     threads: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
@@ -1130,6 +1134,7 @@ def _distill_batch(conn, group: str, origin: str, batch: list[list[dict]]) -> in
     memories = []
     if sum(len(m["content"]) for m in new.values()) >= 40:  # skip batches that are only "thanks!"
         existing = fetch_recent(conn, [group], 80)
+        conn.commit()  # don't hold a transaction open while the extractor runs
         raw = run_extractor(build_prompt(text, existing, group, MESSAGES_PROMPT_FILE))
         memories = parse_memories(raw, text, {m["id"] for m in existing}, set(new))
     for m in memories:

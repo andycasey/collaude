@@ -223,3 +223,31 @@ def test_capture_respects_off_record(db, tmp_path, monkeypatch):
     assert "#offrecord" in (tmp_path / "state" / "collaude.log").read_text()
     with cl.connect(db["alice"]) as conn:
         assert not conn.execute("select 1 from collaude.memories where session_id = %s", (session_id,)).fetchall()
+
+
+@needs_db
+def test_capture_holds_no_transaction_while_extracting(db, tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".collaude.json").write_text('{"group": "g1"}')
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text("".join(TRANSCRIPT))
+    # The extractor reports how many of alice's collaude connections sit idle in a transaction.
+    fake = tmp_path / "fake_extractor.py"
+    fake.write_text(f"""import json, sys, psycopg
+sys.stdin.read()
+with psycopg.connect({db['admin']!r}) as c:
+    n = c.execute("select count(*) from pg_stat_activity where application_name = 'collaude' "
+                  "and usename = %s and state like 'idle in transaction%%'", ({f"t{db['tag']}_alice"!r},)).fetchone()[0]
+print(json.dumps({{'memories': [{{'title': f'idle transactions: {{n}}', 'body': 'b', 'kind': 'other'}}]}}))
+""")
+    monkeypatch.setattr(cl, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setenv("COLLAUDE_DSN", db["alice"])
+    monkeypatch.setenv("COLLAUDE_EXTRACT_CMD", f"{sys.executable} {fake}")
+    session_id = f"sess-{secrets.token_hex(4)}"
+    cl.main(["capture-worker", json.dumps({"session_id": session_id, "transcript_path": str(transcript),
+                                           "cwd": str(proj)})])
+    with cl.connect(db["alice"]) as conn:
+        titles = [r[0] for r in conn.execute("select title from collaude.memories where session_id = %s",
+                                             (session_id,))]
+    assert titles == ["idle transactions: 0"]

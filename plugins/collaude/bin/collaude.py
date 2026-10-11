@@ -1319,6 +1319,7 @@ def cmd_add_group(args) -> None:
 
 
 def cmd_add_user(args) -> None:
+    import psycopg
     from psycopg import sql
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -1326,12 +1327,19 @@ def cmd_add_user(args) -> None:
     role = args.role or _role_for_email(args.email)
     password = secrets.token_urlsafe(24)
     with connect(dsn) as conn:
-        conn.execute(sql.SQL("create role {} login password {} in role collaude_member").format(
-            sql.Identifier(role), sql.Literal(password)))
-        conn.execute("insert into collaude.members (role_name, email, display_name) values (%s, %s, %s)",
-                     (role, args.email, args.name))
-        for g in args.group or []:
-            conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s)", (g, role))
+        try:
+            conn.execute(sql.SQL("create role {} login password {} in role collaude_member").format(
+                sql.Identifier(role), sql.Literal(password)))
+            conn.execute("insert into collaude.members (role_name, email, display_name) values (%s, %s, %s)",
+                         (role, args.email, args.name))
+            for g in args.group or []:
+                conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s)", (g, role))
+        except psycopg.errors.DuplicateObject:
+            sys.exit(f"collaude: a role named {role} already exists; pick another with --role")
+        except psycopg.errors.UniqueViolation:
+            sys.exit(f"collaude: {args.email} is already a member (see `collaude admin list-users`)")
+        except psycopg.errors.ForeignKeyViolation:
+            sys.exit(f"collaude: no such group among {', '.join(args.group)}; create it with `collaude admin add-group`")
         conn.commit()
     info = conninfo_to_dict(dsn)
     # Some poolers (e.g. Supabase's Supavisor) expect "<role>.<tenant>" as the user name;
@@ -1344,13 +1352,18 @@ def cmd_add_user(args) -> None:
 
 
 def cmd_add_member(args) -> None:
+    import psycopg
+
     with connect(admin_dsn(args)) as conn:
         role = conn.execute("select role_name from collaude.members where role_name = %s or email = %s",
                             (args.user, args.user)).fetchone()
         if not role:
             sys.exit(f"collaude: no member {args.user!r}")
-        conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s) on conflict do nothing",
-                     (args.group, role[0]))
+        try:
+            conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s) "
+                         "on conflict do nothing", (args.group, role[0]))
+        except psycopg.errors.ForeignKeyViolation:
+            sys.exit(f"collaude: no group {args.group!r}; create it with `collaude admin add-group`")
         conn.commit()
     print(f"{role[0]} added to {args.group}")
 

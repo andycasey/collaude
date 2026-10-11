@@ -276,3 +276,17 @@ def test_session_start_survives_a_bad_recent_on_start(tmp_path, monkeypatch, cap
     cl.main(["hook", "session-start"])  # must not raise
     ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     assert seen == [8] and 'group "g1"' in ctx
+
+
+@needs_db
+def test_admin_errors_are_explained(db, capsys):
+    tag = db["tag"]
+    run = lambda *a: cl.main(["admin", "--admin-dsn", db["admin"], *a])
+    with pytest.raises(SystemExit, match="already exists; pick another with --role"):
+        run("add-user", "alice@other.org", "--role", f"t{tag}_alice")
+    with pytest.raises(SystemExit, match="already a member"):
+        run("add-user", "alice@example.org", "--role", f"t{tag}_alice2")
+    with pytest.raises(SystemExit, match="no such group"):
+        run("add-user", "dave@example.org", "--role", f"t{tag}_dave", "--group", "nope")
+    with pytest.raises(SystemExit, match="no group 'nope'"):
+        run("add-member", "alice@example.org", "nope")

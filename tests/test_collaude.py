@@ -292,7 +292,10 @@ def test_checkpoint_capture_runs_at_most_once_per_interval(tmp_path, monkeypatch
     assert reply(20) == 2
     assert spawned[0][-2] == "capture-worker"
 
-    monkeypatch.setenv("COLLAUDE_CHECKPOINT_MINUTES", "0")  # off
+    monkeypatch.setenv("COLLAUDE_CHECKPOINT_MINUTES", "0")
+    assert reply(60) == 2
+    monkeypatch.delenv("COLLAUDE_CHECKPOINT_MINUTES")
+    (proj / ".collaude.json").write_text('{"group": "g1"}')  # off by default
     assert reply(60) == 2
 
 

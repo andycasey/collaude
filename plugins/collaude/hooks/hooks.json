@@ -1,5 +1,5 @@
 {
-  "description": "collaude: inject recent team memories at session start; capture new ones every 20 minutes during a session, before compaction and at session end",
+  "description": "collaude: inject recent team memories at session start; capture new ones before compaction, at session end, and optionally every few minutes during a session",
   "hooks": {
     "SessionStart": [
       {

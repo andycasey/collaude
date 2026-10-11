@@ -53,7 +53,7 @@ INGEST_MAX_THREADS = 200
 INGEST_QUIET_HOURS = 2.0
 DISTILL_MAX_FAILURES = 3
 INGEST_LEASE_MINUTES = 30
-CHECKPOINT_MINUTES = 20
+CHECKPOINT_MINUTES = 0  # off: PreCompact and SessionEnd are enough for most sessions
 
 
 # --- configuration -----------------------------------------------------------
@@ -543,7 +543,8 @@ def hook_capture(args) -> None:
     """PreCompact / SessionEnd / Stop: hand the transcript to a detached worker and return at once.
 
     With --checkpoint (the Stop hook, after every reply) a worker starts at most once
-    every checkpoint_minutes per session, so long sessions are captured as they go.
+    every checkpoint_minutes per session, if a project turns it on, so long sessions
+    are captured as they go.
     """
     if os.environ.get("COLLAUDE_DISABLE"):
         return

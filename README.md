@@ -9,7 +9,7 @@ When a collaborator's Claude Code session ends (or is about to compact), a backg
  ┌──────────────────────────────┐              (Supabase, your own, RDS, ...)
  │ Claude Code session          │              ┌─────────────────────────┐
  │   SessionStart hook ─────────┼── recent ───▶│ collaude.memories       │
- │   PreCompact/SessionEnd hook │              │ collaude.sessions       │
+ │   Stop/PreCompact/SessionEnd │              │ collaude.sessions       │
  │     └─ detached worker       │              │ collaude.excerpts       │
  │          condense + redact   │              │ groups / memberships    │
  │          claude -p (haiku)   │── insert ───▶│ row-level security by   │
@@ -111,12 +111,14 @@ collaude status
   "group": "stars",
   "share_excerpts": false,
   "capture": true,
+  "checkpoint_minutes": 0,
   "recent_on_start": 8
 }
 ```
 
 - `share_excerpts`: also upload the condensed, redacted transcript text for each captured session, so collaborators can see the context behind a memory. It's off by default; when off, transcripts stay on the author's machine.
 - `capture`: set to `false` to read memories in this folder without contributing any.
+- `checkpoint_minutes`: also capture a running session every this many minutes, counted from its first reply. It's `0` (off) by default, so sessions are captured at compaction and when they end. Turn it on for folders where sessions stay open for days. `COLLAUDE_CHECKPOINT_MINUTES` overrides it on your machine.
 - `recent_on_start`: how many recent memories Claude is shown when a session starts.
 
 ## Connectors: Slack and email
@@ -161,7 +163,7 @@ If nobody with credentials opens Claude for a while, nothing runs, and the next 
 
 ## What leaves your machine
 
-When a session in a linked folder ends or compacts:
+When a session in a linked folder ends or compacts (and every `checkpoint_minutes`, if set):
 
 1. **To Anthropic, through your own `claude` login:** the new part of the transcript, with secrets redacted, is sent to Haiku for extraction. Text from user and assistant turns is kept, tool inputs are clipped to 400 characters, tool outputs to 600 characters, and thinking, sub-agents and system reminders are dropped.
 2. **To the database:** only the resulting memories (usually zero to three), each with its provenance metadata. The condensed transcript goes too only if `share_excerpts` is on.

@@ -1,5 +1,5 @@
 {
-  "description": "collaude: inject recent team memories at session start; capture new ones before compaction and at session end",
+  "description": "collaude: inject recent team memories at session start; capture new ones before compaction, at session end, and optionally every few minutes during a session",
   "hooks": {
     "SessionStart": [
       {
@@ -30,6 +30,17 @@
             "type": "command",
             "command": "uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}/bin/collaude.py\" hook capture",
             "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}/bin/collaude.py\" hook capture --checkpoint",
+            "timeout": 30
           }
         ]
       }

@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCRIPT = Path(__file__).resolve()
 PLUGIN_ROOT = SCRIPT.parent.parent
 SQL_DIR = PLUGIN_ROOT / "sql"
@@ -53,6 +53,7 @@ INGEST_MAX_THREADS = 200
 INGEST_QUIET_HOURS = 2.0
 DISTILL_MAX_FAILURES = 3
 INGEST_LEASE_MINUTES = 30
+CHECKPOINT_MINUTES = 0  # off: PreCompact and SessionEnd are enough for most sessions
 
 
 # --- configuration -----------------------------------------------------------
@@ -530,8 +531,21 @@ def hook_session_start(_args) -> None:
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "\n".join(lines)}}))
 
 
-def hook_capture(_args) -> None:
-    """PreCompact / SessionEnd: hand the transcript to a detached worker and return at once."""
+def _checkpoint_minutes(proj: dict) -> float:
+    raw = os.environ.get("COLLAUDE_CHECKPOINT_MINUTES", proj.get("checkpoint_minutes", CHECKPOINT_MINUTES))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return CHECKPOINT_MINUTES
+
+
+def hook_capture(args) -> None:
+    """PreCompact / SessionEnd / Stop: hand the transcript to a detached worker and return at once.
+
+    With --checkpoint (the Stop hook, after every reply) a worker starts at most once
+    every checkpoint_minutes per session, if a project turns it on, so long sessions
+    are captured as they go.
+    """
     if os.environ.get("COLLAUDE_DISABLE"):
         return
     payload = _read_hook_payload()
@@ -541,6 +555,19 @@ def hook_capture(_args) -> None:
     if not payload.get("session_id") or not Path(payload.get("transcript_path") or "").is_file():
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "checkpoint", False):
+        minutes = _checkpoint_minutes(found[1])
+        if minutes <= 0:
+            return
+        stamp = STATE_DIR / "offsets" / f"{payload['session_id']}.checkpoint"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        now, started = time.time(), stamp.exists()
+        if started and now - stamp.stat().st_mtime < minutes * 60:
+            return
+        stamp.touch()
+        os.utime(stamp, (now, now))
+        if not started:
+            return  # the first reply starts the clock; short sessions are left to SessionEnd
     with open(STATE_DIR / "collaude.log", "a") as logf:
         subprocess.Popen([sys.executable, str(SCRIPT), "capture-worker", json.dumps(payload)],
                          stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True)
@@ -1523,7 +1550,9 @@ def main(argv=None) -> None:
     sp = add("hook", None, "entry points for Claude Code hooks")
     hsub = sp.add_subparsers(dest="hook", required=True)
     hsub.add_parser("session-start").set_defaults(fn=hook_session_start)
-    hsub.add_parser("capture").set_defaults(fn=hook_capture)
+    sp = hsub.add_parser("capture")
+    sp.add_argument("--checkpoint", action="store_true", help="throttle to once every checkpoint_minutes")
+    sp.set_defaults(fn=hook_capture)
     sp = add("capture-worker", capture_worker, argparse.SUPPRESS)
     sp.add_argument("payload")
 

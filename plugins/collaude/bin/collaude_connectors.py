@@ -1,4 +1,4 @@
-"""Connectors that pull external messages (Slack, email) into collaude.
+"""Connectors that pull external messages (Slack, email, GitHub) into collaude.
 
 Standard library only. Each connector implements:
 
@@ -26,6 +26,7 @@ import json
 import re
 import secrets
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -513,7 +514,151 @@ class ImapConnector:
                 pass
 
 
-KINDS = {"slack": SlackConnector, "imap": ImapConnector}
+# --- GitHub issues and pull requests ---------------------------------------------
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+GITHUB_MAX_CHARS = 4000
+
+
+def _gh_time(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+class GitHubConnector:
+    kind = "github"
+    origin = "github"
+    secret_prompt = "GitHub token (read-only Issues and Pull requests), or press Enter to use your `gh` login"
+
+    def __init__(self, settings: dict, secret: str, api_base: str = "https://api.github.com"):
+        self.settings = settings
+        self.secret = secret
+        self.api_base = api_base.rstrip("/")
+        self._token: str | None = None
+
+    def token(self) -> str:
+        """The stored token, or "gh" to ask the GitHub CLI each run (so nothing is copied out of it)."""
+        if self.secret != "gh":
+            return self.secret
+        if self._token is None:
+            try:
+                out = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                raise ConnectorError(f"could not run `gh auth token`: {e}") from e
+            if out.returncode != 0 or not out.stdout.strip():
+                raise ConnectorError("`gh auth token` gave no token; run `gh auth login`")
+            self._token = out.stdout.strip()
+        return self._token
+
+    def _get(self, path: str, **params) -> tuple[object, str | None]:
+        url = path if path.startswith("http") else f"{self.api_base}{path}"
+        if params:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        headers = {"Authorization": f"Bearer {self.token()}", "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "collaude"}
+        for _ in range(5):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+                    nxt = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get("Link") or "")
+                    return json.load(r), nxt.group(1) if nxt else None
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 429) and (e.headers.get("Retry-After") or e.headers.get("X-RateLimit-Remaining") == "0"):
+                    wait = int(e.headers.get("Retry-After") or
+                               max(int(e.headers.get("X-RateLimit-Reset", "0")) - time.time(), 1))
+                    if wait > 60:
+                        raise ConnectorError(f"GitHub rate limit; resets in {wait // 60} min") from e
+                    time.sleep(wait)
+                    continue
+                hint = {401: " (the token is invalid or expired)",
+                        404: " (no such repo, or the token can't see it)"}.get(e.code, "")
+                raise ConnectorError(f"GitHub {path}: HTTP {e.code}{hint}") from e
+            except urllib.error.URLError as e:
+                raise ConnectorError(f"GitHub {path}: {e.reason}") from e
+        raise ConnectorError(f"GitHub {path}: rate limited")
+
+    def _paged(self, path: str, max_pages: int = 50, **params):
+        url, page = path, 0
+        params = {"per_page": 100, **params}
+        while url and page < max_pages:
+            data, url = self._get(url, **params)
+            params, page = {}, page + 1  # the next link already carries them
+            yield from data
+
+    def check(self) -> dict:
+        user, _ = self._get("/user")
+        return {"login": user["login"]}
+
+    def describe(self) -> str:
+        how = " (via gh)" if self.secret == "gh" else ""
+        return f"GitHub as @{self.settings.get('login')}{how}"
+
+    def list_sources(self) -> list[tuple[str, str]]:
+        repos = self._paged("/user/repos", max_pages=10, sort="pushed",
+                            affiliation="owner,collaborator,organization_member")
+        return [(r["full_name"], r["full_name"]) for r in repos if not r.get("archived")]
+
+    def resolve(self, text: str) -> tuple[str, str]:
+        m = re.fullmatch(r"(?:https?://github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?", text.strip())
+        if not m:
+            raise ConnectorError(f"expected owner/repo, got {text!r}")
+        repo, _ = self._get(f"/repos/{m.group(1)}/{m.group(2)}")
+        return repo["full_name"], repo["full_name"]
+
+    @staticmethod
+    def _clean(text: str | None) -> str:
+        text = _HTML_COMMENT_RE.sub("", text or "").strip()
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text if len(text) <= GITHUB_MAX_CHARS else text[:GITHUB_MAX_CHARS] + "\n…[clipped]"
+
+    def _item(self, repo: str, label: str, number: int, ext: str, obj: dict, content: str,
+              subject: str | None) -> dict | None:
+        user = obj.get("user") or {}
+        if not content or user.get("type") == "Bot":
+            return None
+        return {
+            "external_id": f"{repo}:{ext}",
+            "thread_key": f"{repo}#{number}",
+            "container": label,
+            "author_name": user.get("login"),
+            "author_handle": user.get("login"),
+            "source_time": _gh_time(obj["created_at"]),
+            "permalink": obj.get("html_url"),
+            "subject": subject,
+            "content": content,
+        }
+
+    def fetch(self, source_key: str, cursor: str | None, since: datetime, label: str | None = None):
+        label = label or source_key
+        start = cursor or since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        items, newest, titles = [], start, {}
+        # Issues and PRs updated since the cursor. A new comment bumps its issue too,
+        # so this also yields the title, and the opening post as context, for every
+        # thread with new comments. Re-fetched posts are dropped as duplicates.
+        for it in self._paged(f"/repos/{source_key}/issues", state="all", since=start, sort="updated",
+                              direction="asc"):
+            kind = "PR" if it.get("pull_request") else "Issue"
+            titles[it["number"]] = f"{kind} #{it['number']}: {it['title']}"
+            body = self._clean(it.get("body"))
+            if x := self._item(source_key, label, it["number"], f"issue{it['id']}", it,
+                               f"{it['title']}\n\n{body}".strip(), titles[it["number"]]):
+                items.append(x)
+            newest = max(newest, it["updated_at"])
+        for c in self._paged(f"/repos/{source_key}/issues/comments", since=start, sort="updated", direction="asc"):
+            n = int(c["issue_url"].rsplit("/", 1)[-1])
+            if x := self._item(source_key, label, n, f"comment{c['id']}", c, self._clean(c.get("body")),
+                               titles.get(n)):
+                items.append(x)
+            newest = max(newest, c["updated_at"])
+        for c in self._paged(f"/repos/{source_key}/pulls/comments", since=start, sort="updated", direction="asc"):
+            n = int(c["pull_request_url"].rsplit("/", 1)[-1])
+            body = self._clean(c.get("body"))
+            if x := self._item(source_key, label, n, f"review{c['id']}", c,
+                               f"[on {c.get('path')}] {body}" if body else "", titles.get(n)):
+                items.append(x)
+            newest = max(newest, c["updated_at"])
+        return items, newest
+
+
+KINDS = {"slack": SlackConnector, "imap": ImapConnector, "github": GitHubConnector}
 
 
 def make(kind: str, settings: dict, secret: str):

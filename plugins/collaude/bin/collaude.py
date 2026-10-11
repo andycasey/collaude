@@ -876,6 +876,39 @@ def _read_secret(args, prompt: str) -> str:
     return value
 
 
+def _oauth_client(args, held: str | None) -> tuple[str, str]:
+    """The Google OAuth client to sign in with: from the flags, or reused from this machine's saved login."""
+    cc = _connectors_mod()
+    if args.oauth_client_file:
+        try:
+            return cc.oauth_client_from_file(args.oauth_client_file)
+        except cc.ConnectorError as e:
+            sys.exit(f"collaude: {e}")
+    if args.oauth_client_id:
+        secret = args.oauth_client_secret
+        if not secret:
+            if not sys.stdin.isatty():
+                sys.exit("collaude: pass --oauth-client-secret or --oauth-client-file")
+            secret = getpass.getpass("OAuth client secret: ").strip()
+        return args.oauth_client_id, secret
+    try:
+        saved = json.loads(held or "")
+        return saved["client_id"], saved["client_secret"]
+    except (ValueError, KeyError, TypeError):
+        sys.exit("collaude: Google sign-in needs an OAuth client; pass --oauth-client-file client_secret.json "
+                 "(a Desktop app client from Google Cloud Console)")
+
+
+def _oauth_login(args, cid: str, user: str) -> str:
+    cc = _connectors_mod()
+    client_id, client_secret = _oauth_client(args, load_secrets().get(cid))
+    try:
+        refresh_token = cc.oauth_authorize(client_id, client_secret, login_hint=user)
+    except cc.ConnectorError as e:
+        sys.exit(f"collaude: {e}")
+    return cc.oauth_secret(client_id, client_secret, refresh_token)
+
+
 def _connector_impl(conn, cid: str, secret: str | None = None):
     row = conn.execute("select kind, settings from collaude.connectors where id = %s", (cid,)).fetchone()
     if not row:
@@ -943,15 +976,19 @@ def cmd_connector_add(args) -> None:
     kind = "imap" if args.kind == "email" else args.kind
     cid = args.name or args.kind
     settings: dict = {}
+    oauth = kind == "imap" and bool(args.oauth or args.oauth_client_file or args.oauth_client_id)
     if kind == "imap":
-        if not args.host or not args.user:
+        host = args.host or ("imap.gmail.com" if oauth else None)
+        if not host or not args.user:
             sys.exit("collaude: email connectors need --host and --user (e.g. --host imap.gmail.com)")
-        settings = {"host": args.host, "user": args.user, "port": args.port}
+        settings = {"host": host, "user": args.user, "port": args.port}
+        if oauth:
+            settings["auth"] = "oauth"
     if args.quiet_hours is not None:
         settings["quiet_hours"] = args.quiet_hours
     if kind == "slack" and not args.secret_env:
         print(SLACK_SETUP)
-    secret = _read_secret(args, cc.KINDS[kind].secret_prompt)
+    secret = _oauth_login(args, cid, args.user) if oauth else _read_secret(args, cc.KINDS[kind].secret_prompt)
     impl = cc.make(kind, settings, secret)
     try:
         settings.update(impl.check())
@@ -1006,11 +1043,15 @@ def cmd_connector_sources(args) -> None:
 def cmd_connector_login(args) -> None:
     cc = _connectors_mod()
     with connect() as conn:
-        row = conn.execute("select kind from collaude.connectors where id = %s", (args.name,)).fetchone()
-        if not row:
-            sys.exit(f"collaude: no connector {args.name!r} visible to you")
-        secret = _read_secret(args, cc.KINDS[row[0]].secret_prompt)
-        impl = _connector_impl(conn, args.name, secret)
+        row = conn.execute("select kind, settings from collaude.connectors where id = %s", (args.name,)).fetchone()
+    if not row:
+        sys.exit(f"collaude: no connector {args.name!r} visible to you")
+    kind, settings = row
+    if settings.get("auth") == "oauth":
+        secret = _oauth_login(args, args.name, settings["user"])
+    else:
+        secret = _read_secret(args, cc.KINDS[kind].secret_prompt)
+    impl = cc.make(kind, settings, secret)
     try:
         impl.check()
     except cc.ConnectorError as e:
@@ -1504,15 +1545,24 @@ def main(argv=None) -> None:
         a.add_argument("--secret-env", metavar="VAR", help="read the token/password from this environment variable "
                                                           "instead of prompting")
 
+    def oauth_opt(a):
+        a.add_argument("--oauth-client-file", metavar="JSON",
+                       help="Google OAuth client (Desktop app) JSON downloaded from Google Cloud Console")
+        a.add_argument("--oauth-client-id", help="Google OAuth client id, instead of --oauth-client-file")
+        a.add_argument("--oauth-client-secret", help="its client secret (prompted for if left out)")
+
     def backfill_opt(a):
         a.add_argument("--backfill-days", type=int, default=14, help="history to ingest on first run (default 14)")
 
     a = csub.add_parser("add", help="connect a Slack workspace or a mailbox (prompts for what it needs)")
     a.add_argument("kind", choices=("slack", "email", "imap"), help="email and imap are the same thing")
     a.add_argument("--name", help="connector name (default: the kind)")
-    a.add_argument("--host", help="IMAP server, e.g. imap.gmail.com")
+    a.add_argument("--host", help="IMAP server, e.g. imap.gmail.com (the default with --oauth)")
     a.add_argument("--user", help="IMAP login, e.g. lists-bot@example.org")
     a.add_argument("--port", type=int, default=993)
+    a.add_argument("--oauth", action="store_true",
+                   help="sign in to Gmail or Google Workspace in the browser instead of using a password")
+    oauth_opt(a)
     a.add_argument("--route", action="append", metavar="SOURCE=GROUP",
                    help="'#channel=group' or 'folder=group'; repeatable. Without it you are asked per channel/folder")
     a.add_argument("--quiet-hours", type=float, help=f"wait this long after a thread's last message before "
@@ -1536,6 +1586,7 @@ def main(argv=None) -> None:
     a = csub.add_parser("login", help="store credentials for an existing connector on this machine")
     a.add_argument("name")
     secret_opt(a)
+    oauth_opt(a)
     a.set_defaults(fn=cmd_connector_login)
     csub.add_parser("list", help="connectors, routes, and sync status").set_defaults(fn=cmd_connector_list)
     for verb in ("pause", "resume"):

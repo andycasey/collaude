@@ -28,6 +28,9 @@ class FakeSlack:
     def __init__(self):
         t0 = NOW - 3 * DAY
         self.users = {"U1": "Alice Astro", "U2": "Bob Bolometer"}
+        self.channels = [{"id": "C0STARS1", "name": "clump-rotation", "is_member": True},
+                         {"id": "C0OTHER1", "name": "random", "is_member": False}]
+        self.broken = set()  # channels whose history calls fail
         self.history = {"C0STARS1": [
             {"ts": f"{t0:.6f}", "user": "U1", "text": "Gaia DR3 parallaxes for the clump sample need the "
              "Lindegren zero-point correction, otherwise distances come out 3% too large.",
@@ -50,12 +53,13 @@ class FakeSlack:
             return {"ok": True, "team": "Flatiron Test", "team_id": "T1", "url": "https://fi-test.slack.com/",
                     "user": "collaude"}
         if method == "conversations.list":
-            return {"ok": True, "channels": [{"id": "C0STARS1", "name": "clump-rotation", "is_member": True},
-                                             {"id": "C0OTHER1", "name": "random", "is_member": False}]}
+            return {"ok": True, "channels": self.channels}
         if method == "conversations.info":
             return {"ok": True, "channel": {"id": q["channel"], "name": "clump-rotation"}}
         if method == "users.info":
             return {"ok": True, "user": {"name": q["user"], "profile": {"real_name": self.users[q["user"]]}}}
+        if q.get("channel") in self.broken:
+            return {"ok": False, "error": "not_in_channel"}
         msgs = self.history.get(q.get("channel"), [])
         oldest = float(q.get("oldest", 0))
         if method == "conversations.history":  # top-level messages and thread parents only
@@ -350,3 +354,78 @@ def test_email_connector_and_distill_cap(db, as_user, monkeypatch, capsys):
     assert "lists" not in json.loads(cl.SECRETS_FILE.read_text())
     with cl.connect(db["bob"]) as conn:  # history kept
         assert len(cl.search_sources(conn, "spectroscopic", ["g2"])) == 3
+
+
+@needs_db
+def test_one_failing_route_does_not_stop_the_others(db, slack, as_user, monkeypatch, capsys):
+    slack.channels.append({"id": "C0GONE01", "name": "aaa-kicked", "is_member": True})
+    as_user("alice")
+    monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+    cl.main(["connector", "add", "slack", "--name", "slack3", "--secret-env", "SLACK_TOKEN",
+             "--route", "#aaa-kicked=g1", "--route", "#clump-rotation=g1"])
+    slack.broken.add("C0GONE01")  # e.g. the bot was removed from the channel
+    capsys.readouterr()
+    cl.main(["ingest", "slack3"])
+    out = capsys.readouterr().out
+    assert "slack3: 3 new messages, 1 new memories; 1 of 2 sources failed" in out
+    assert "#aaa-kicked: ConnectorError: Slack conversations.history: not_in_channel" in out
+    cl.main(["connector", "list"])
+    assert "ERROR: #aaa-kicked: ConnectorError" in capsys.readouterr().out
+
+
+@needs_db
+def test_a_thread_the_extractor_fails_on_is_retried_then_given_up(db, as_user, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cc.imaplib, "IMAP4_SSL", FakeImap)
+    FakeImap.mailbox = {"lists/stars": {
+        1: make_mail(201, "good", "Result: the asteroseismic masses agree with the eclipsing binaries to 2%.", days_ago=4),
+        2: make_mail(202, "bad", "POISON this thread makes the extractor reply with something that is not JSON.",
+                     days_ago=3),
+        3: make_mail(203, "also good", "Result: the red clump luminosity calibration shifts by 0.03 mag.", days_ago=2)}}
+    as_user("carol")
+    fake = tmp_path / "flaky_extractor.py"
+    fake.write_text("import sys\nprompt = sys.stdin.read()\n"
+                    "if 'POISON' in prompt:\n    print('Sorry, I cannot help with that.')\n"
+                    f"else:\n    sys.stdin = __import__('io').StringIO(prompt)\n    exec({FAKE_EXTRACTOR!r})\n")
+    monkeypatch.setenv("COLLAUDE_EXTRACT_CMD", f"{sys.executable} {fake}")
+    monkeypatch.setenv("MAILPW", "app-pass")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    cl.main(["connector", "add", "email", "--name", "flaky", "--host", "imap.example.org", "--user", "bot",
+             "--secret-env", "MAILPW", "--route", "lists/stars=g2"])
+    capsys.readouterr()
+    cl.main(["ingest", "flaky"])  # the two good threads get through despite sharing a batch with the bad one
+    assert "flaky: 3 new messages, 2 new memories" in capsys.readouterr().out
+    state = "select distill_failures, distilled_at is not null from collaude.sources where subject = 'bad' " \
+            "and connector_id = 'flaky'"
+    with cl.connect(db["carol"]) as conn:
+        assert conn.execute(state).fetchone() == (1, False)
+    cl.main(["ingest", "flaky"])
+    cl.main(["ingest", "flaky"])
+    with cl.connect(db["carol"]) as conn:
+        assert conn.execute(state).fetchone() == (3, True)  # given up, so it no longer blocks the queue
+    assert "extractor failed (3/3, giving up)" in (cl.STATE_DIR / "collaude.log").read_text()
+
+
+@needs_db
+def test_lease_is_renewed_and_a_lapsed_lease_stops_the_run(db, slack, as_user, monkeypatch):
+    as_user("alice")
+    monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+    cl.main(["connector", "add", "slack", "--name", "slack4", "--secret-env", "SLACK_TOKEN",
+             "--route", "#clump-rotation=g1"])
+    until = "select lease_until from collaude.connectors where id = 'slack4'"
+    with cl.connect(db["alice"]) as conn, cl.connect(db["admin"]) as admin:
+        assert conn.execute("select collaude.claim_ingest('slack4', interval '0', interval '1 minute')").fetchone()[0]
+        conn.commit()
+        before = conn.execute(until).fetchone()[0]
+        conn.commit()
+        cl._renew_lease(conn, "slack4")
+        assert conn.execute(until).fetchone()[0] > before + timedelta(minutes=20)
+        conn.commit()
+        admin.execute("update collaude.connectors set lease_until = now() - interval '1 second' where id = 'slack4'")
+        admin.commit()
+        with pytest.raises(cl.LeaseLost):
+            cl._renew_lease(conn, "slack4")
+        with cl.connect(db["carol"]) as other:  # someone else takes over; alice can't renew their lease
+            assert other.execute("select collaude.claim_ingest('slack4', interval '0', interval '1 minute')").fetchone()[0]
+            other.commit()
+        with pytest.raises(cl.LeaseLost):
+            cl._renew_lease(conn, "slack4")

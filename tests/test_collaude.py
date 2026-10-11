@@ -7,6 +7,7 @@ admin connection string:
         uv run --with pytest --with 'psycopg[binary]' pytest tests
 """
 
+import contextlib
 import io
 import json
 import secrets
@@ -42,6 +43,14 @@ def test_condense_keeps_dialogue_and_drops_noise():
     assert "hmm" not in text and "subagent chatter" not in text
 
 
+def test_condense_drops_injected_user_turns():
+    text = cl.condense_transcript(TRANSCRIPT + [
+        entry("user", [{"type": "text", "text": "Base directory for this skill: ..."}], isMeta=True),
+        entry("user", "This session is being continued. Summary: ...", isCompactSummary=True),
+    ])
+    assert "Base directory" not in text and "Summary" not in text
+
+
 def test_redact():
     s = cl.redact("export PGPASSWORD=hunter2hunter2 and postgresql://bob:s3cret@db/x and key sk-ant-abcdefghijklmnopqrstuvwxyz")
     assert "hunter2" not in s and "s3cret" not in s and "abcdefghijklmnop" not in s
@@ -67,6 +76,10 @@ def test_off_record():
     assert cl.is_off_record(TRANSCRIPT + [entry("user", "this is #offrecord please")])
     # A mention inside tool output does not count.
     assert not cl.is_off_record(TRANSCRIPT + [entry("user", [{"type": "tool_result", "content": "#offrecord"}])])
+    # Nor does text Claude Code injects as a user turn: a loaded skill or a compaction summary.
+    assert not cl.is_off_record(TRANSCRIPT + [entry("user", [{"type": "text", "text": "write #offrecord"}], isMeta=True)])
+    assert not cl.is_off_record(TRANSCRIPT + [entry("user", "Summary: #offrecord skips capture",
+                                                    isCompactSummary=True, isVisibleInTranscriptOnly=True)])
 
 
 def test_find_project(tmp_path):
@@ -211,3 +224,69 @@ def test_capture_respects_off_record(db, tmp_path, monkeypatch):
     assert "#offrecord" in (tmp_path / "state" / "collaude.log").read_text()
     with cl.connect(db["alice"]) as conn:
         assert not conn.execute("select 1 from collaude.memories where session_id = %s", (session_id,)).fetchall()
+
+
+@needs_db
+def test_capture_holds_no_transaction_while_extracting(db, tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".collaude.json").write_text('{"group": "g1"}')
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text("".join(TRANSCRIPT))
+    # The extractor reports how many of alice's collaude connections sit idle in a transaction.
+    fake = tmp_path / "fake_extractor.py"
+    fake.write_text(f"""import json, sys, psycopg
+sys.stdin.read()
+with psycopg.connect({db['admin']!r}) as c:
+    n = c.execute("select count(*) from pg_stat_activity where application_name = 'collaude' "
+                  "and usename = %s and state like 'idle in transaction%%'", ({f"t{db['tag']}_alice"!r},)).fetchone()[0]
+print(json.dumps({{'memories': [{{'title': f'idle transactions: {{n}}', 'body': 'b', 'kind': 'other'}}]}}))
+""")
+    monkeypatch.setattr(cl, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setenv("COLLAUDE_DSN", db["alice"])
+    monkeypatch.setenv("COLLAUDE_EXTRACT_CMD", f"{sys.executable} {fake}")
+    session_id = f"sess-{secrets.token_hex(4)}"
+    cl.main(["capture-worker", json.dumps({"session_id": session_id, "transcript_path": str(transcript),
+                                           "cwd": str(proj)})])
+    with cl.connect(db["alice"]) as conn:
+        titles = [r[0] for r in conn.execute("select title from collaude.memories where session_id = %s",
+                                             (session_id,))]
+    assert titles == ["idle transactions: 0"]
+
+
+def test_parse_memories_tolerates_odd_shapes():
+    one = {"title": "Momentum dumps cause 13.7 d dip", "body": "Mask them.", "kind": "gotcha"}
+    out = cl.parse_memories(json.dumps([{**one, "tags": "TESS, systematics"}, one]), "", set())
+    assert len(out) == 2 and out[0]["tags"] == ["tess", "systematics"]
+    assert cl.parse_memories("```json\n" + json.dumps({"memories": [one]}) + "\n```", "", set())[0]["kind"] == "gotcha"
+    assert cl.parse_memories('{"memories": {"title": "not a list"}}', "", set()) == []
+    with pytest.raises(ValueError):
+        cl.parse_memories("I can't help with that.", "", set())
+
+
+def test_session_start_survives_a_bad_recent_on_start(tmp_path, monkeypatch, capsys):
+    (tmp_path / ".collaude.json").write_text('{"group": "g1", "recent_on_start": "lots"}')
+    monkeypatch.setattr(cl, "SECRETS_FILE", tmp_path / "secrets.json")
+    monkeypatch.setattr(cl, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setenv("COLLAUDE_DSN", "postgresql://example/none")
+    seen = []
+    monkeypatch.setattr(cl, "connect", lambda **kw: contextlib.nullcontext())
+    monkeypatch.setattr(cl, "fetch_recent", lambda conn, groups, n: seen.append(n) or [])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": str(tmp_path)})))
+    cl.main(["hook", "session-start"])  # must not raise
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert seen == [8] and 'group "g1"' in ctx
+
+
+@needs_db
+def test_admin_errors_are_explained(db, capsys):
+    tag = db["tag"]
+    run = lambda *a: cl.main(["admin", "--admin-dsn", db["admin"], *a])
+    with pytest.raises(SystemExit, match="already exists; pick another with --role"):
+        run("add-user", "alice@other.org", "--role", f"t{tag}_alice")
+    with pytest.raises(SystemExit, match="already a member"):
+        run("add-user", "alice@example.org", "--role", f"t{tag}_alice2")
+    with pytest.raises(SystemExit, match="no such group"):
+        run("add-user", "dave@example.org", "--role", f"t{tag}_dave", "--group", "nope")
+    with pytest.raises(SystemExit, match="no group 'nope'"):
+        run("add-member", "alice@example.org", "nope")

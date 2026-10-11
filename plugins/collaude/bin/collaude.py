@@ -51,6 +51,8 @@ MAX_MEMORIES_PER_CAPTURE = 5
 INGEST_STALE_MINUTES = int(os.environ.get("COLLAUDE_INGEST_STALE_MINUTES", "30"))
 INGEST_MAX_THREADS = 200
 INGEST_QUIET_HOURS = 2.0
+DISTILL_MAX_FAILURES = 3
+INGEST_LEASE_MINUTES = 30
 
 
 # --- configuration -----------------------------------------------------------
@@ -176,6 +178,12 @@ def _result_text(content) -> str:
     return ""
 
 
+def _is_injected(entry: dict) -> bool:
+    """Entries Claude Code writes as user turns that the user did not type: loaded skills,
+    command output, and compaction summaries."""
+    return bool(entry.get("isMeta") or entry.get("isCompactSummary") or entry.get("isVisibleInTranscriptOnly"))
+
+
 def condense_transcript(lines: list[str]) -> str:
     """Turn Claude Code JSONL transcript lines into compact, readable text."""
     out = []
@@ -185,7 +193,7 @@ def condense_transcript(lines: list[str]) -> str:
         except json.JSONDecodeError:
             continue
         kind = entry.get("type")
-        if kind not in ("user", "assistant") or entry.get("isSidechain"):
+        if kind not in ("user", "assistant") or entry.get("isSidechain") or _is_injected(entry):
             continue
         speaker = "USER" if kind == "user" else "ASSISTANT"
         content = (entry.get("message") or {}).get("content")
@@ -216,7 +224,7 @@ def is_off_record(lines: list[str]) -> bool:
             entry = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if entry.get("type") != "user":
+        if entry.get("type") != "user" or _is_injected(entry):
             continue
         content = (entry.get("message") or {}).get("content")
         if isinstance(content, str):
@@ -265,10 +273,15 @@ def run_extractor(prompt: str) -> str:
 
 def parse_memories(raw: str, transcript: str, existing_ids: set[int],
                    allowed_source_ids: set[int] | None = None) -> list[dict]:
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError(f"extractor returned no JSON: {raw[:200]!r}")
-    items = json.loads(raw[start:end + 1]).get("memories") or []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:  # JSON wrapped in prose or a code fence
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError(f"extractor returned no JSON: {raw[:200]!r}") from None
+        data = json.loads(raw[start:end + 1])
+    items = data if isinstance(data, list) else data.get("memories") if isinstance(data, dict) else None
+    items = items if isinstance(items, list) else []
     norm_transcript = _norm(transcript)
     clean = []
     for m in items[:MAX_MEMORIES_PER_CAPTURE]:
@@ -282,6 +295,9 @@ def parse_memories(raw: str, transcript: str, existing_ids: set[int],
         # Keep the quote only if it really is verbatim; it is our provenance anchor.
         if not quote or _norm(quote) not in norm_transcript:
             quote = None
+        tags = m.get("tags") or []
+        if isinstance(tags, str):
+            tags = tags.split(",")
         sup = m.get("supersedes")
         try:
             sup = int(sup) if sup is not None else None
@@ -302,7 +318,7 @@ def parse_memories(raw: str, transcript: str, existing_ids: set[int],
             "title": title,
             "body": body,
             "kind": m.get("kind") if m.get("kind") in KINDS else "other",
-            "tags": [str(t).strip().lower()[:40] for t in (m.get("tags") or []) if str(t).strip()][:5],
+            "tags": [str(t).strip().lower()[:40] for t in tags if str(t).strip()][:5],
             "confidence": m.get("confidence") if m.get("confidence") in ("low", "medium", "high") else "medium",
             "evidence_quote": quote[:1000] if quote else None,
             "supersedes": sup if sup in existing_ids else None,
@@ -492,8 +508,12 @@ def hook_session_start(_args) -> None:
     _, proj = found
     group = proj["group"]
     try:
+        n_recent = max(0, int(proj.get("recent_on_start", 8)))
+    except (TypeError, ValueError):
+        n_recent = 8
+    try:
         with connect(timeout=4) as conn:
-            recent = fetch_recent(conn, [group], int(proj.get("recent_on_start", 8)))
+            recent = fetch_recent(conn, [group], n_recent)
     except Exception as e:  # never block a session on the memory server
         log(f"session-start: {e!r}")
         return
@@ -562,10 +582,12 @@ def capture_worker(args) -> None:
             text = "…[earlier part of session omitted]\n" + text[-MAX_TRANSCRIPT_CHARS:]
 
         try:
+            # Two short connections, so no transaction stays open while the extractor runs.
             with connect() as conn:
                 existing = fetch_recent(conn, [group], 80)
-                raw = run_extractor(build_prompt(text, existing, group))
-                memories = parse_memories(raw, text, {m["id"] for m in existing})
+            raw = run_extractor(build_prompt(text, existing, group))
+            memories = parse_memories(raw, text, {m["id"] for m in existing})
+            with connect() as conn:
                 if memories:
                     insert_session(conn, session_id, group, cwd, transcript_path)
                     if proj.get("share_excerpts"):
@@ -1034,14 +1056,35 @@ def cmd_slack_manifest(_args) -> None:
     print(json.dumps(_connectors_mod().SLACK_MANIFEST, indent=2))
 
 
-def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int) -> str:
+class LeaseLost(Exception):
+    pass
+
+
+def _renew_lease(conn, cid: str) -> None:
+    """Extend this run's lease before the next step; stop if another machine may have taken over."""
+    ok = conn.execute("select collaude.renew_ingest(%s, make_interval(mins => %s))",
+                      (cid, INGEST_LEASE_MINUTES)).fetchone()[0]
+    conn.commit()
+    if not ok:
+        raise LeaseLost(f"lease on {cid} expired; stopping so another run can take over")
+
+
+def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int) -> tuple[str, str | None]:
+    """Fetch every route, then distil. Returns (summary, error); one failing route doesn't stop the rest."""
     impl = _connectors_mod().make(kind, settings, secret)
     routes = conn.execute("""select source_key, source_label, group_id, cursor, backfill_from
                              from collaude.connector_routes where connector_id = %s order by source_key""",
                           (cid,)).fetchall()
-    fetched = 0
+    conn.commit()  # end the read before talking to the remote service
+    fetched, errors = 0, []
     for key, label, group, cursor, backfill in routes:
-        items, new_cursor = impl.fetch(key, cursor, backfill, label)
+        _renew_lease(conn, cid)
+        try:
+            items, new_cursor = impl.fetch(key, cursor, backfill, label)
+        except Exception as e:
+            conn.rollback()
+            errors.append(f"{label or key}: {type(e).__name__}: {e}")
+            continue
         for it in items:
             cur = conn.execute("""
                 insert into collaude.sources
@@ -1056,8 +1099,12 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
         conn.execute("""update collaude.connector_routes set cursor = %s, last_synced_at = now()
                         where connector_id = %s and source_key = %s""", (new_cursor, cid, key))
         conn.commit()
-    made = distill(conn, cid, impl.origin, float(settings.get("quiet_hours", INGEST_QUIET_HOURS)), max_threads)
-    return f"{fetched} new messages, {made} new memories"
+    made = distill(conn, cid, impl.origin, float(settings.get("quiet_hours", INGEST_QUIET_HOURS)), max_threads,
+                   renew=lambda: _renew_lease(conn, cid))
+    summary = f"{fetched} new messages, {made} new memories"
+    if errors:
+        summary += f"; {len(errors)} of {len(routes)} sources failed"
+    return summary, "; ".join(errors)[:500] or None
 
 
 def _render_thread(msgs: list[dict]) -> str:
@@ -1073,7 +1120,8 @@ def _render_thread(msgs: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, max_chars: int = 60_000) -> int:
+def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, max_chars: int = 60_000,
+            renew=lambda: None) -> int:
     """Turn threads that have gone quiet into memories, oldest first, at most max_threads per run."""
     from psycopg.rows import dict_row
 
@@ -1094,6 +1142,7 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
             order by s.group_id, p.first_time, s.thread_key, s.source_time""",
             {"c": cid, "quiet": quiet_hours, "n": max_threads})
         rows = cur.fetchall()
+    conn.commit()
 
     threads: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
@@ -1109,11 +1158,13 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
         for msgs in group_threads:
             text = _render_thread(msgs)
             if batch and size + len(text) > max_chars:
+                renew()
                 made += _distill_batch(conn, group, origin, batch)
                 batch, size = [], 0
             batch.append(msgs)
             size += len(text) + 1
         if batch:
+            renew()
             made += _distill_batch(conn, group, origin, batch)
     return made
 
@@ -1124,8 +1175,23 @@ def _distill_batch(conn, group: str, origin: str, batch: list[list[dict]]) -> in
     memories = []
     if sum(len(m["content"]) for m in new.values()) >= 40:  # skip batches that are only "thanks!"
         existing = fetch_recent(conn, [group], 80)
-        raw = run_extractor(build_prompt(text, existing, group, MESSAGES_PROMPT_FILE))
-        memories = parse_memories(raw, text, {m["id"] for m in existing}, set(new))
+        conn.commit()  # don't hold a transaction open while the extractor runs
+        try:
+            raw = run_extractor(build_prompt(text, existing, group, MESSAGES_PROMPT_FILE))
+            memories = parse_memories(raw, text, {m["id"] for m in existing}, set(new))
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+            if len(batch) > 1:  # find the thread that fails; let the others through
+                return sum(_distill_batch(conn, group, origin, [msgs]) for msgs in batch)
+            failures = conn.execute("""
+                update collaude.sources set distill_failures = distill_failures + 1,
+                       distilled_at = case when distill_failures + 1 >= %s then now() end
+                where id = any(%s) returning distill_failures""",
+                (DISTILL_MAX_FAILURES, list(new))).fetchone()[0]
+            conn.commit()
+            gave_up = ", giving up" if failures >= DISTILL_MAX_FAILURES else ""
+            log(f"distill {batch[0][0]['container']} thread {batch[0][0]['thread_key']}: extractor failed "
+                f"({failures}/{DISTILL_MAX_FAILURES}{gave_up}): {str(e)[:300]}")
+            return 0
     for m in memories:
         when = max(new[sid]["source_time"] for sid in m["source_ids"])
         insert_memory(conn, group, m, None, origin, EXTRACTOR_ID, when)
@@ -1150,8 +1216,8 @@ def cmd_ingest(args) -> None:
                 continue
             try:
                 claimed = conn.execute(
-                    "select collaude.claim_ingest(%s, make_interval(mins => %s), interval '30 minutes')",
-                    (cid, args.stale_after)).fetchone()[0]
+                    "select collaude.claim_ingest(%s, make_interval(mins => %s), make_interval(mins => %s))",
+                    (cid, args.stale_after, INGEST_LEASE_MINUTES)).fetchone()[0]
                 conn.commit()
             except psycopg.errors.InsufficientPrivilege as e:
                 conn.rollback()
@@ -1163,7 +1229,9 @@ def cmd_ingest(args) -> None:
                 continue
             error = None
             try:
-                summary = ingest_connector(conn, cid, kind, settings, held[cid], args.max_threads)
+                summary, error = ingest_connector(conn, cid, kind, settings, held[cid], args.max_threads)
+                if error:
+                    summary += f" ({error})"
             except Exception as e:
                 conn.rollback()
                 error = f"{type(e).__name__}: {e}"[:500]
@@ -1251,6 +1319,7 @@ def cmd_add_group(args) -> None:
 
 
 def cmd_add_user(args) -> None:
+    import psycopg
     from psycopg import sql
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -1258,12 +1327,19 @@ def cmd_add_user(args) -> None:
     role = args.role or _role_for_email(args.email)
     password = secrets.token_urlsafe(24)
     with connect(dsn) as conn:
-        conn.execute(sql.SQL("create role {} login password {} in role collaude_member").format(
-            sql.Identifier(role), sql.Literal(password)))
-        conn.execute("insert into collaude.members (role_name, email, display_name) values (%s, %s, %s)",
-                     (role, args.email, args.name))
-        for g in args.group or []:
-            conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s)", (g, role))
+        try:
+            conn.execute(sql.SQL("create role {} login password {} in role collaude_member").format(
+                sql.Identifier(role), sql.Literal(password)))
+            conn.execute("insert into collaude.members (role_name, email, display_name) values (%s, %s, %s)",
+                         (role, args.email, args.name))
+            for g in args.group or []:
+                conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s)", (g, role))
+        except psycopg.errors.DuplicateObject:
+            sys.exit(f"collaude: a role named {role} already exists; pick another with --role")
+        except psycopg.errors.UniqueViolation:
+            sys.exit(f"collaude: {args.email} is already a member (see `collaude admin list-users`)")
+        except psycopg.errors.ForeignKeyViolation:
+            sys.exit(f"collaude: no such group among {', '.join(args.group)}; create it with `collaude admin add-group`")
         conn.commit()
     info = conninfo_to_dict(dsn)
     # Some poolers (e.g. Supabase's Supavisor) expect "<role>.<tenant>" as the user name;
@@ -1276,13 +1352,18 @@ def cmd_add_user(args) -> None:
 
 
 def cmd_add_member(args) -> None:
+    import psycopg
+
     with connect(admin_dsn(args)) as conn:
         role = conn.execute("select role_name from collaude.members where role_name = %s or email = %s",
                             (args.user, args.user)).fetchone()
         if not role:
             sys.exit(f"collaude: no member {args.user!r}")
-        conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s) on conflict do nothing",
-                     (args.group, role[0]))
+        try:
+            conn.execute("insert into collaude.memberships (group_id, role_name) values (%s, %s) "
+                         "on conflict do nothing", (args.group, role[0]))
+        except psycopg.errors.ForeignKeyViolation:
+            sys.exit(f"collaude: no group {args.group!r}; create it with `collaude admin add-group`")
         conn.commit()
     print(f"{role[0]} added to {args.group}")
 

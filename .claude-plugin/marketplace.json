@@ -2,8 +2,7 @@
   "name": "collaude",
   "description": "Shared, searchable team memory for Claude Code",
   "owner": {
-    "name": "acasey",
-    "email": "acasey@flatironinstitute.org"
+    "name": "Andy Casey"
   },
   "plugins": [
     {

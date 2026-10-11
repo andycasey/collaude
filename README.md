@@ -34,7 +34,7 @@ flowchart LR
 - **Across machines.** Work on your laptop in the morning and on the cluster in the afternoon. Both connect to the same memory, so neither has to be told twice.
 - **Across your team.** Point a group at the memory and your collaborators' sessions draw on it too. Nobody re-runs the dead end you already tried.
 
-A memory belongs to a *group*. A group can be just you, a project, or a whole lab.
+A memory belongs to a *group*. A group can be just you, a project, or a whole lab, and a folder or a Slack channel can belong to several groups at once.
 
 ## Why collaude
 
@@ -96,16 +96,19 @@ That's it. Sessions in that folder now add to the group's memory and draw on it.
 
 **On another machine,** repeat steps 1 to 3 with the same connection string. Because `.collaude.json` is committed, any clone of the project is already linked. **For another folder,** run `collaude init my-group` there too.
 
+**A folder can belong to several groups.** `collaude init my-group my-lab` links it to both: its memories are shared with both groups, stored once, and each session starts by seeing the latest from both. A collaborator who is only in one of them shares into that one. To change a folder's groups later, run `collaude init ... --force`, which keeps its other settings.
+
 ## Use it
 
 Mostly you won't need to: Claude searches the memory on its own when it's relevant. Ask it *"have we looked at this before?"* and it will check. You can also use the command line:
 
 ```sh
-collaude search "detection limit"                  # search this project's group
+collaude search "detection limit"                  # search this folder's groups
 collaude search "zero point" --all-groups --kind dead_end
+collaude search "cryostat" -g my-lab -g my-group   # particular groups
 collaude recent -n 20
 collaude show 42                                   # full text and provenance
-collaude add --kind decision --title "..." --body "..."
+collaude add --kind decision --title "..." --body "..."    # -g GROUP (repeatable) to choose who sees it
 collaude retract 42 --reason "bug in the binning"
 collaude status
 ```
@@ -126,6 +129,8 @@ collaude connector add github            # press Enter to use your gh login, the
 collaude connector list                  # what's connected, last sync, any errors
 collaude search --messages "zero point"  # search the raw messages
 ```
+
+A channel, mail folder or repo can feed several groups: use `--route '#channel=group-a,group-b'`, or route it again to another group. It is fetched once, and its messages and memories are shared with every group it feeds. Adding a group to a channel that is already being ingested also shares the last `--backfill-days` of its messages, and the memories made from them.
 
 Catch-up runs in the background whenever someone who holds the credentials starts a Claude session, so no server is needed. A lease in the database makes sure only one machine runs a connector at a time. Re-fetching a message never stores it twice, and a thread or channel that fails never blocks the others.
 
@@ -175,7 +180,9 @@ collaude connector add email --host ... --user ... --secret-env MAILPW --route '
 
 collaude connector sources slack                         # channels the credentials can see
 collaude connector route slack '#new-channel' my-group --backfill-days 30
-collaude connector unroute slack '#new-channel'
+collaude connector route slack '#new-channel' my-group my-lab           # feed it into several groups
+collaude connector unroute slack '#new-channel'                          # stop feeding your groups
+collaude connector unroute slack '#new-channel' my-lab                   # or just one of them
 collaude connector login slack                           # a second person stores credentials too
 collaude connector pause slack / resume slack
 collaude connector rename slack lab-slack             # other machines pick up the new name by themselves
@@ -183,7 +190,7 @@ collaude connector remove slack                          # disconnect; ingested 
 collaude ingest                                          # run now instead of at the next session start
 ```
 
-Tokens and passwords stay in `~/.config/collaude/secrets.json` on the machine where they were entered. Only the routing (which channel feeds which group) is stored in the database. Only a connector's creator can route it, and only to a group they belong to; any member of a group can unroute a channel from it.
+Tokens and passwords stay in `~/.config/collaude/secrets.json` on the machine where they were entered. Only the routing (which channel feeds which group) is stored in the database. Only a connector's creator can route it, and only to a group they belong to; any member of a group can unroute a channel from it, which leaves the channel feeding its other groups.
 
 Memories from a connector are credited to the person whose machine ingested them, and `collaude show` lists the original messages with their real authors and links.
 
@@ -206,7 +213,7 @@ Redaction catches private keys, common API tokens, and passwords in URLs and con
 
 ```json
 {
-  "group": "my-group",
+  "groups": ["my-group", "my-lab"],
   "capture": true,
   "share_excerpts": false,
   "recent_on_start": 8,
@@ -216,7 +223,7 @@ Redaction catches private keys, common API tokens, and passwords in URLs and con
 
 | Option | What it does |
 |---|---|
-| `group` | The group this folder belongs to. |
+| `groups` | The groups this folder belongs to. Sessions here are shared with every one of them that the person running Claude is in. A single group can also be written `"group": "my-group"`. |
 | `capture` | Set to `false` to read the group's memories here without adding any. |
 | `share_excerpts` | Also upload the condensed, redacted transcript, so collaborators can see the context behind a memory. Off by default. |
 | `recent_on_start` | How many recent memories Claude sees when a session starts. |
@@ -255,7 +262,6 @@ When you're ready to share, run it on a server your collaborators can reach (on 
 
 - **Meaning-based search** with `pgvector`, blended with full-text ranking.
 - **More connectors:** arXiv and ADS alerts, GitHub Discussions, document comments. A connector is a small class in `bin/collaude_connectors.py`.
-- **Several groups per folder.** Today a folder belongs to one group, and other groups are reachable with `--all-groups`.
 
 Removing someone from a group stops what they can read from then on, but it can't take back what they've already seen. Extraction quality depends on `prompts/extract.md`, so tune it for your field. Each memory records the extractor version that wrote it.
 

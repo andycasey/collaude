@@ -1142,6 +1142,42 @@ def cmd_connector_remove(args) -> None:
           "Messages and memories already ingested are kept.")
 
 
+def cmd_connector_rename(args) -> None:
+    import psycopg
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", args.new):
+        sys.exit("collaude: connector names are lowercase letters, digits, '-' and '_'")
+    with connect() as conn:
+        try:
+            conn.execute("select collaude.rename_connector(%s, %s)", (args.old, args.new))
+            conn.commit()
+        except psycopg.errors.UniqueViolation:
+            sys.exit(f"collaude: a connector named {args.new!r} already exists")
+        except (psycopg.errors.InsufficientPrivilege, psycopg.errors.ObjectInUse) as e:
+            sys.exit(f"collaude: {e.diag.message_primary}")
+    secret = load_secrets().get(args.old)
+    if secret is not None:
+        save_secret(args.new, secret)
+        save_secret(args.old, None)
+    print(f"Renamed {args.old!r} to {args.new!r}. Other machines with credentials for it "
+          "pick up the new name on their next ingest.")
+
+
+def _adopt_renamed(conn, held: dict) -> dict:
+    """Move credentials stored under a connector's old name to its new one."""
+    rows = conn.execute("select id, settings -> 'previous_ids' from collaude.connectors").fetchall()
+    current = {cid for cid, _ in rows}
+    rows = [(cid, previous) for cid, previous in rows if previous]
+    for cid, previous in rows:
+        # skip an old name that has since been given to another connector
+        old = next((p for p in previous if p in held and p not in current), None)
+        if old and cid not in held:
+            save_secret(cid, held[old])
+            save_secret(old, None)
+            log(f"ingest {cid}: adopted credentials stored under its old name {old!r}")
+    return load_secrets() if rows else held
+
+
 def cmd_slack_manifest(_args) -> None:
     print(json.dumps(_connectors_mod().SLACK_MANIFEST, indent=2))
 
@@ -1316,6 +1352,7 @@ def cmd_ingest(args) -> None:
             print("No connector credentials on this machine. Add one with `collaude connector add slack|email`.")
         return
     with connect() as conn:
+        held = _adopt_renamed(conn, held)
         rows = conn.execute("""select id, kind, settings from collaude.connectors
                                where enabled and id = any(%s) order by id""", (list(held),)).fetchall()
         for cid, kind, settings in rows:
@@ -1619,6 +1656,10 @@ def main(argv=None) -> None:
     a.add_argument("group")
     backfill_opt(a)
     a.set_defaults(fn=cmd_connector_route)
+    a = csub.add_parser("rename", help="rename a connector (only its creator, and not while it runs)")
+    a.add_argument("old")
+    a.add_argument("new")
+    a.set_defaults(fn=cmd_connector_rename)
     a = csub.add_parser("unroute", help="stop feeding a channel or folder")
     a.add_argument("name")
     a.add_argument("source")

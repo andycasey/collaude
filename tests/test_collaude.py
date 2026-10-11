@@ -264,6 +264,38 @@ def test_parse_memories_tolerates_odd_shapes():
         cl.parse_memories("I can't help with that.", "", set())
 
 
+def test_checkpoint_capture_runs_at_most_once_per_interval(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".collaude.json").write_text('{"group": "g1", "checkpoint_minutes": 20}')
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text("".join(TRANSCRIPT))
+    monkeypatch.setattr(cl, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setenv("COLLAUDE_DSN", "postgresql://unused")
+    monkeypatch.delenv("COLLAUDE_CHECKPOINT_MINUTES", raising=False)
+    spawned = []
+    monkeypatch.setattr(cl.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd))
+    clock = [1_000_000.0]
+    monkeypatch.setattr(cl.time, "time", lambda: clock[0])
+
+    def reply(minutes_later):
+        clock[0] += minutes_later * 60
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(
+            {"session_id": "s1", "transcript_path": str(transcript), "cwd": str(proj), "hook_event_name": "Stop"})))
+        cl.main(["hook", "capture", "--checkpoint"])
+        return len(spawned)
+
+    assert reply(0) == 0    # first reply starts the clock
+    assert reply(5) == 0
+    assert reply(16) == 1   # 21 minutes in
+    assert reply(1) == 1
+    assert reply(20) == 2
+    assert spawned[0][-2] == "capture-worker"
+
+    monkeypatch.setenv("COLLAUDE_CHECKPOINT_MINUTES", "0")  # off
+    assert reply(60) == 2
+
+
 def test_session_start_survives_a_bad_recent_on_start(tmp_path, monkeypatch, capsys):
     (tmp_path / ".collaude.json").write_text('{"group": "g1", "recent_on_start": "lots"}')
     monkeypatch.setattr(cl, "SECRETS_FILE", tmp_path / "secrets.json")

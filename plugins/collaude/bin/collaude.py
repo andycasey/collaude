@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SCRIPT = Path(__file__).resolve()
 PLUGIN_ROOT = SCRIPT.parent.parent
 SQL_DIR = PLUGIN_ROOT / "sql"

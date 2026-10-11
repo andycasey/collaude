@@ -120,12 +120,33 @@ Connectors pull messages from the channels and mail folders you choose, wait unt
 collaude connector slack-manifest        # create the Slack app from this manifest
 collaude connector add slack             # paste the bot token, then choose a group for each channel
 collaude connector add email --host imap.example.org --user lists@example.org
+collaude connector add email --oauth --user me@example.org --oauth-client-file client_secret.json   # Gmail
 
 collaude connector list                  # what's connected, last sync, any errors
 collaude search --messages "zero point"  # search the raw messages
 ```
 
 Catch-up runs in the background whenever someone who holds the credentials starts a Claude session, so no server is needed. A lease in the database makes sure only one machine runs a connector at a time. Re-fetching a message never stores it twice, and a thread or channel that fails never blocks the others.
+
+<details>
+<summary><b>Gmail and Google Workspace</b></summary>
+
+Gmail works with an [app password](https://myaccount.google.com/apppasswords), but many Workspace domains turn those off. Signing in with Google instead takes a one-time OAuth client, which you create yourself:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), pick or create a project. A project in your organisation is best for a Workspace account.
+2. Under **Google Auth Platform → Audience**, choose **Internal** for a Workspace account. For a personal Gmail account, choose **External** and add yourself as a test user.
+3. Under **Clients**, create an OAuth client of type **Desktop app** and download its JSON.
+4. Connect, and sign in when the browser opens:
+
+   ```sh
+   collaude connector add email --oauth --user me@example.org --oauth-client-file ~/Downloads/client_secret_….json
+   ```
+
+The host defaults to `imap.gmail.com`. If the browser runs on another machine, for example over SSH, open the printed link there and paste back the `http://127.0.0.1…` address it ends up on. To run the same mailbox from a second machine, use `collaude connector login email --oauth-client-file …`. The client JSON can be shared within your group, but the sign-in is stored only on the machine where it happened.
+
+Google expires sign-ins after 7 days for an External app that is still in *Testing*. Publish the app to stop this, or run `collaude connector login email` again when `collaude connector list` reports the error.
+
+</details>
 
 <details>
 <summary><b>More connector commands</b></summary>
@@ -216,7 +237,6 @@ When you're ready to share, run it on a server your collaborators can reach (on 
 
 - **Meaning-based search** with `pgvector`, blended with full-text ranking.
 - **More connectors:** GitHub issues and PRs, arXiv and ADS alerts, document comments. A connector is a small class in `bin/collaude_connectors.py`.
-- **OAuth email login**, for mail domains that don't allow app passwords.
 - **Several groups per folder.** Today a folder belongs to one group, and other groups are reachable with `--all-groups`.
 
 Removing someone from a group stops what they can read from then on, but it can't take back what they've already seen. Extraction quality depends on `prompts/extract.md`, so tune it for your field. Each memory records the extractor version that wrote it.

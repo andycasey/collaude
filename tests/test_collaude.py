@@ -42,6 +42,14 @@ def test_condense_keeps_dialogue_and_drops_noise():
     assert "hmm" not in text and "subagent chatter" not in text
 
 
+def test_condense_drops_injected_user_turns():
+    text = cl.condense_transcript(TRANSCRIPT + [
+        entry("user", [{"type": "text", "text": "Base directory for this skill: ..."}], isMeta=True),
+        entry("user", "This session is being continued. Summary: ...", isCompactSummary=True),
+    ])
+    assert "Base directory" not in text and "Summary" not in text
+
+
 def test_redact():
     s = cl.redact("export PGPASSWORD=hunter2hunter2 and postgresql://bob:s3cret@db/x and key sk-ant-abcdefghijklmnopqrstuvwxyz")
     assert "hunter2" not in s and "s3cret" not in s and "abcdefghijklmnop" not in s

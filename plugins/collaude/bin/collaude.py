@@ -176,6 +176,12 @@ def _result_text(content) -> str:
     return ""
 
 
+def _is_injected(entry: dict) -> bool:
+    """Entries Claude Code writes as user turns that the user did not type: loaded skills,
+    command output, and compaction summaries."""
+    return bool(entry.get("isMeta") or entry.get("isCompactSummary") or entry.get("isVisibleInTranscriptOnly"))
+
+
 def condense_transcript(lines: list[str]) -> str:
     """Turn Claude Code JSONL transcript lines into compact, readable text."""
     out = []
@@ -185,7 +191,7 @@ def condense_transcript(lines: list[str]) -> str:
         except json.JSONDecodeError:
             continue
         kind = entry.get("type")
-        if kind not in ("user", "assistant") or entry.get("isSidechain"):
+        if kind not in ("user", "assistant") or entry.get("isSidechain") or _is_injected(entry):
             continue
         speaker = "USER" if kind == "user" else "ASSISTANT"
         content = (entry.get("message") or {}).get("content")
@@ -206,12 +212,6 @@ def condense_transcript(lines: list[str]) -> str:
                 if text:
                     out.append(f"RESULT: {_clip(text, 600)}")
     return "\n".join(out)
-
-
-def _is_injected(entry: dict) -> bool:
-    """Entries Claude Code writes as user turns that the user did not type: loaded skills,
-    command output, and compaction summaries."""
-    return bool(entry.get("isMeta") or entry.get("isCompactSummary") or entry.get("isVisibleInTranscriptOnly"))
 
 
 def is_off_record(lines: list[str]) -> bool:

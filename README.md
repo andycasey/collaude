@@ -2,21 +2,37 @@
 
 # collaude
 
-### Your team's memory, written while you work.
+### One memory for every Claude you run.
 
-A Claude Code plugin that turns everyday sessions into a shared, searchable memory for your group.
+A Claude Code plugin that gives all your sessions a shared, searchable brain:<br>
+across folders, across machines, and across your team.
 
 </div>
 
 ---
 
-Every Claude Code session turns up something worth keeping: a bug's real cause, an approach that failed, a decision and the reason for it. Usually it stays in one person's terminal and is gone by the next week.
+Every Claude Code session turns up something worth keeping: a bug's real cause, an approach that failed, a decision and the reason for it. Then the session ends and it's gone. Open Claude in another folder, on your other computer, or hand the project to a colleague, and you start from zero.
 
-**collaude keeps it.** As you work, it picks out what a colleague would be glad to know and adds it to a memory your whole group can search. The next time anyone in the group opens Claude in that project, Claude already knows.
+**collaude remembers.** As you work, it picks out what's worth knowing later and adds it to a central memory. Every session connected to that memory starts out knowing it, and can search the rest.
 
+```mermaid
+flowchart LR
+    laptop["💻 You, on your laptop"] <--> brain
+    cluster["🖥️ You, on the cluster"] <--> brain
+    folder["📁 You, in another project folder"] <--> brain
+    team["🧑‍🔬 Your collaborators"] <--> brain
+    slack["💬 Slack and mailing lists"] --> brain
+    brain(("🧠 collaude"))
+    style brain fill:#f5e6ff,stroke:#8b5cf6,stroke-width:2px
 ```
-  you work with Claude  ──▶  collaude notes what matters  ──▶  your team's Claude knows it too
-```
+
+## One brain, wherever you work
+
+- **Across folders.** The analysis repo, the paper draft and the scratch directory can share one memory. What you learned debugging in one is there when you're writing in another.
+- **Across machines.** Work on your laptop in the morning and on the cluster in the afternoon. Both connect to the same memory, so neither has to be told twice.
+- **Across your team.** Point a group at the memory and your collaborators' sessions draw on it too. Nobody re-runs the dead end you already tried.
+
+A memory belongs to a *group*. A group can be just you, a project, or a whole lab.
 
 ## Why collaude
 
@@ -24,7 +40,7 @@ Every Claude Code session turns up something worth keeping: a bug's real cause, 
 
 **🔎 Answers, not transcripts.** Each session becomes a few short memories, typically zero to three: findings, dead ends, decisions, methods and gotchas. Search ranks them by relevance and by how recent they are.
 
-**🧾 Every memory can be traced.** A memory records who it came from, when, and where: the project folder, git branch and commit, and a verbatim quote from the conversation behind it. Memories can be corrected or retracted, but nothing is silently deleted.
+**🧾 Every memory can be traced.** A memory records which person, machine and folder it came from, when, the git branch and commit, and a verbatim quote from the conversation behind it. Memories can be corrected or retracted, but nothing is silently deleted.
 
 **🔒 Private by default.** Groups are closed. The database itself enforces who can read what, so another group's memories never reach your session. Type `#offrecord` in any message and that session is never recorded.
 
@@ -34,13 +50,13 @@ Every Claude Code session turns up something worth keeping: a bug's real cause, 
 
 ## How it works
 
-1. **You work.** Use Claude Code as you always do, in a project folder linked to a group.
-2. **collaude listens.** When a session ends or compacts, a background job takes the new part of the conversation, redacts secrets, and asks a small model what is worth sharing.
-3. **Your team benefits.** The memories are stored with their provenance. Every new session in the group starts by seeing the latest memories, and Claude knows to search the rest before it repeats work.
+1. **You work.** Use Claude Code as you always do, in any folder linked to a group.
+2. **collaude listens.** When a session ends or compacts, a background job takes the new part of the conversation, redacts secrets, and asks a small model what is worth remembering.
+3. **Every session benefits.** The memories are stored with their provenance. Each new session in the group, on any machine and by anyone in it, starts by seeing the latest memories, and Claude knows to search the rest before it repeats work.
 
 ## Get started
 
-You need [uv](https://docs.astral.sh/uv/) and a personal connection string from your group's admin.
+You need [uv](https://docs.astral.sh/uv/) and a personal connection string from whoever runs your database. To run the database yourself, see [For admins](#for-admins).
 
 **1. Install the plugin** in Claude Code:
 
@@ -49,16 +65,20 @@ You need [uv](https://docs.astral.sh/uv/) and a personal connection string from 
 /plugin install collaude@collaude
 ```
 
-**2. Put the `collaude` command on your path.** It's a single script that runs itself through uv:
+**2. Put the `collaude` command on your path.** Claude Code keeps the plugin at `~/.claude/plugins/marketplaces/collaude`, and the command is a single script inside it that runs itself through uv:
 
 ```sh
-ln -s <path-to-plugin>/bin/collaude.py ~/.local/bin/collaude
+mkdir -p ~/.local/bin
+ln -sf ~/.claude/plugins/marketplaces/collaude/plugins/collaude/bin/collaude.py ~/.local/bin/collaude
+collaude --help        # if this isn't found, add ~/.local/bin to your PATH
 ```
 
-**3. Connect** to your group's database. The string is saved to `~/.config/collaude/config.json`, readable only by you.
+The link stays valid when the plugin updates. If you added the marketplace from a local clone instead, link to `plugins/collaude/bin/collaude.py` in that clone.
+
+**3. Connect** to the database. The string is saved to `~/.config/collaude/config.json`, readable only by you.
 
 ```sh
-collaude setup --dsn '<the string your admin sent you>'
+collaude setup --dsn '<your connection string>'
 collaude passwd        # optional: choose your own password
 ```
 
@@ -70,11 +90,13 @@ collaude init my-group
 git add .collaude.json && git commit -m "Share Claude memories with my-group"
 ```
 
-That's it. From now on, sessions in that folder add to the group's memory and draw on it.
+That's it. Sessions in that folder now add to the group's memory and draw on it.
+
+**On another machine,** repeat steps 1 to 3 with the same connection string. Because `.collaude.json` is committed, any clone of the project is already linked. **For another folder,** run `collaude init my-group` there too.
 
 ## Use it
 
-Mostly you won't need to: Claude searches the memory on its own when it's relevant. Ask it *"has anyone looked at this before?"* and it will check. You can also use the command line:
+Mostly you won't need to: Claude searches the memory on its own when it's relevant. Ask it *"have we looked at this before?"* and it will check. You can also use the command line:
 
 ```sh
 collaude search "detection limit"                  # search this project's group

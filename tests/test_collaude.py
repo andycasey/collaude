@@ -7,6 +7,7 @@ admin connection string:
         uv run --with pytest --with 'psycopg[binary]' pytest tests
 """
 
+import contextlib
 import io
 import json
 import secrets
@@ -261,3 +262,17 @@ def test_parse_memories_tolerates_odd_shapes():
     assert cl.parse_memories('{"memories": {"title": "not a list"}}', "", set()) == []
     with pytest.raises(ValueError):
         cl.parse_memories("I can't help with that.", "", set())
+
+
+def test_session_start_survives_a_bad_recent_on_start(tmp_path, monkeypatch, capsys):
+    (tmp_path / ".collaude.json").write_text('{"group": "g1", "recent_on_start": "lots"}')
+    monkeypatch.setattr(cl, "SECRETS_FILE", tmp_path / "secrets.json")
+    monkeypatch.setattr(cl, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setenv("COLLAUDE_DSN", "postgresql://example/none")
+    seen = []
+    monkeypatch.setattr(cl, "connect", lambda **kw: contextlib.nullcontext())
+    monkeypatch.setattr(cl, "fetch_recent", lambda conn, groups, n: seen.append(n) or [])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": str(tmp_path)})))
+    cl.main(["hook", "session-start"])  # must not raise
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert seen == [8] and 'group "g1"' in ctx

@@ -508,8 +508,12 @@ def hook_session_start(_args) -> None:
     _, proj = found
     group = proj["group"]
     try:
+        n_recent = max(0, int(proj.get("recent_on_start", 8)))
+    except (TypeError, ValueError):
+        n_recent = 8
+    try:
         with connect(timeout=4) as conn:
-            recent = fetch_recent(conn, [group], int(proj.get("recent_on_start", 8)))
+            recent = fetch_recent(conn, [group], n_recent)
     except Exception as e:  # never block a session on the memory server
         log(f"session-start: {e!r}")
         return

@@ -178,6 +178,7 @@ collaude connector route slack '#new-channel' my-group --backfill-days 30
 collaude connector unroute slack '#new-channel'
 collaude connector login slack                           # a second person stores credentials too
 collaude connector pause slack / resume slack
+collaude connector rename slack lab-slack             # other machines pick up the new name by themselves
 collaude connector remove slack                          # disconnect; ingested memories stay
 collaude ingest                                          # run now instead of at the next session start
 ```

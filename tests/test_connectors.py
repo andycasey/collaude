@@ -558,3 +558,178 @@ def test_lease_is_renewed_and_a_lapsed_lease_stops_the_run(db, slack, as_user, m
             other.commit()
         with pytest.raises(cl.LeaseLost):
             cl._renew_lease(conn, "slack4")
+
+
+# --- fake GitHub -----------------------------------------------------------------
+
+
+def _iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class FakeGitHub:
+    """Enough of the GitHub REST API for the connector: one repo with an issue, a PR, and their comments."""
+
+    repo = "stars-lab/clump-rotation"
+
+    def __init__(self):
+        t0 = NOW - 3 * DAY
+        base = f"https://github.com/{self.repo}"
+        user = {"login": "alice", "type": "User"}
+        self.issues = [
+            {"id": 11, "number": 7, "title": "Distances 3% too large", "user": user, "created_at": _iso(t0),
+             "updated_at": _iso(t0 + 900), "html_url": f"{base}/issues/7",
+             "body": "<!-- describe the bug -->\nGaia DR3 parallaxes need the Lindegren zero-point correction, "
+                     "otherwise the clump distances come out 3% too large."},
+            {"id": 12, "number": 8, "title": "Apply the zero-point recipe", "pull_request": {}, "user": user,
+             "created_at": _iso(t0 + 600), "updated_at": _iso(t0 + 1200), "html_url": f"{base}/pull/8",
+             "body": "Fixes #7."},
+            {"id": 13, "number": 9, "title": "Bump numpy", "user": {"login": "dependabot[bot]", "type": "Bot"},
+             "created_at": _iso(t0), "updated_at": _iso(t0), "html_url": f"{base}/pull/9", "body": "Bumps numpy."},
+        ]
+        self.comments = [
+            {"id": 21, "issue_url": f"https://api.github.com/repos/{self.repo}/issues/7",
+             "user": {"login": "bob", "type": "User"}, "created_at": _iso(t0 + 300), "updated_at": _iso(t0 + 300),
+             "html_url": f"{base}/issues/7#issuecomment-21",
+             "body": "Confirmed on Alice's sample: the zero-point offset is -0.017 mas for the whole clump."},
+            {"id": 22, "issue_url": f"https://api.github.com/repos/{self.repo}/issues/7",
+             "user": {"login": "ci-bot", "type": "Bot"}, "created_at": _iso(t0 + 400),
+             "updated_at": _iso(t0 + 400), "html_url": f"{base}/issues/7#issuecomment-22", "body": "Build passed."},
+        ]
+        self.review_comments = [
+            {"id": 31, "pull_request_url": f"https://api.github.com/repos/{self.repo}/pulls/8", "path": "fit.py",
+             "user": {"login": "bob", "type": "User"}, "created_at": _iso(t0 + 1200),
+             "updated_at": _iso(t0 + 1200), "html_url": f"{base}/pull/8#discussion_r31",
+             "body": "The offset depends on G magnitude, so use the full recipe, not a constant."},
+        ]
+
+    def handle(self, path, q):
+        since = q.get("since", "")
+        if path == "/user":
+            return {"login": "alice"}
+        if path == "/user/repos":
+            return [{"full_name": self.repo}, {"full_name": "stars-lab/old", "archived": True}]
+        if path.lower() == f"/repos/{self.repo}".lower():
+            return {"full_name": self.repo}
+        if path == f"/repos/{self.repo}/issues":
+            return [i for i in self.issues if i["updated_at"] >= since]
+        if path == f"/repos/{self.repo}/issues/comments":
+            return [c for c in self.comments if c["updated_at"] >= since]
+        if path == f"/repos/{self.repo}/pulls/comments":
+            return [c for c in self.review_comments if c["updated_at"] >= since]
+        return None
+
+
+@pytest.fixture
+def github(monkeypatch):
+    fake = FakeGitHub()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            assert self.headers["Authorization"] == "Bearer ghp-test"
+            q = dict(urllib.parse.parse_qsl(url.query))
+            data = fake.handle(url.path, q)
+            if data is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            page = int(q.get("page", 1))  # serve lists one item per page, to exercise Link paging
+            if isinstance(data, list):
+                body = data[page - 1:page]
+                if page < len(data):
+                    nxt = urllib.parse.urlencode({**q, "page": page + 1})
+                    link = f'<http://127.0.0.1:{server.server_port}{url.path}?{nxt}>; rel="next"'
+                else:
+                    link = None
+            else:
+                body, link = data, None
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if link:
+                self.send_header("Link", link)
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    orig = cc.GitHubConnector.__init__
+    monkeypatch.setattr(cc.GitHubConnector, "__init__",
+                        lambda self, settings, secret, api_base=base: orig(self, settings, secret, api_base))
+    yield fake
+    server.shutdown()
+
+
+def test_github_fetch_threads_skips_bots_and_pages(github):
+    g = cc.make("github", {}, "ghp-test")
+    assert g.check() == {"login": "alice"}
+    assert g.list_sources() == [(FakeGitHub.repo, FakeGitHub.repo)]
+    assert g.resolve(f"https://github.com/{FakeGitHub.repo.upper()}.git") == (FakeGitHub.repo, FakeGitHub.repo)
+    with pytest.raises(cc.ConnectorError, match="404"):
+        g.resolve("stars-lab/missing")
+
+    items, cursor = g.fetch(FakeGitHub.repo, None, datetime.now(timezone.utc) - timedelta(days=14))
+    by_id = {it["external_id"].split(":")[1]: it for it in items}
+    assert set(by_id) == {"issue11", "issue12", "comment21", "review31"}  # no bot issue or comment
+    assert by_id["issue11"]["thread_key"] == by_id["comment21"]["thread_key"] == f"{FakeGitHub.repo}#7"
+    assert by_id["comment21"]["subject"] == "Issue #7: Distances 3% too large"
+    assert by_id["review31"]["subject"] == "PR #8: Apply the zero-point recipe"
+    assert by_id["review31"]["content"].startswith("[on fit.py] The offset depends")
+    assert "describe the bug" not in by_id["issue11"]["content"]
+    assert by_id["issue11"]["permalink"].endswith("/issues/7") and by_id["comment21"]["author_name"] == "bob"
+    assert cursor == _iso(NOW - 3 * DAY + 1200)
+
+    github.comments.append({**github.comments[0], "id": 23, "created_at": _iso(NOW - 3600),
+                            "updated_at": _iso(NOW - 3600), "body": "A late follow-up on the zero point."})
+    github.issues[0]["updated_at"] = _iso(NOW - 3600)
+    items, cursor2 = g.fetch(FakeGitHub.repo, cursor, datetime.now(timezone.utc))
+    assert "comment23" in {it["external_id"].split(":")[1] for it in items} and cursor2 == _iso(NOW - 3600)
+
+
+def test_github_token_from_gh(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return cc.subprocess.CompletedProcess(cmd, 0, stdout="gho_fromgh\n", stderr="")
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    g = cc.make("github", {"login": "alice"}, "gh")
+    assert g.token() == g.token() == "gho_fromgh" and calls == [["gh", "auth", "token"]]
+    assert g.describe() == "GitHub as @alice (via gh)"
+    monkeypatch.setattr(cc.subprocess, "run",
+                        lambda cmd, **kw: cc.subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not logged in"))
+    with pytest.raises(cc.ConnectorError, match="gh auth login"):
+        cc.make("github", {}, "gh").token()
+
+
+def test_ask_routes_by_name_when_there_are_many_sources(monkeypatch, capsys):
+    class Many:
+        def list_sources(self):
+            return [(f"o/r{i}", f"o/r{i}") for i in range(30)]
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("o/r3=g1\nnonsense\n o/r7 = g2 \n\n"))
+    assert cl._ask_routes(Many(), ["g1", "g2"]) == [("o/r3", "g1"), ("o/r7", "g2")]
+    assert "can see 30 sources" in capsys.readouterr().out
+
+
+@needs_db
+def test_github_end_to_end(db, github, as_user, monkeypatch, capsys):
+    as_user("alice")
+    monkeypatch.setenv("GH_TOKEN_TEST", "ghp-test")
+    cl.main(["connector", "add", "github", "--secret-env", "GH_TOKEN_TEST", "--route", f"{FakeGitHub.repo}=g1"])
+    out = capsys.readouterr().out
+    assert "Credentials work: GitHub as @alice" in out and f"{FakeGitHub.repo} -> g1" in out
+    cl.main(["ingest", "github"])
+    assert "github: 4 new messages, 2 new memories" in capsys.readouterr().out
+    cl.main(["ingest", "github"])  # the boundary items come back and are dropped as duplicates
+    assert "github: 0 new messages" in capsys.readouterr().out
+    with cl.connect(db["carol"]) as conn:
+        mems = [m for m in cl.fetch_recent(conn, ["g1"], 10) if m["origin"] == "github"]
+        assert len(mems) == 2  # one per thread with something to say; the bot PR has nothing
+        hits = cl.search_sources(conn, "zero-point offset", None)
+        assert hits and hits[0]["container"] == FakeGitHub.repo

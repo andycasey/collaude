@@ -23,7 +23,7 @@ flowchart LR
     cluster["🖥️ You, on the cluster"] <--> brain
     folder["📁 You, in another project folder"] <--> brain
     team["🧑‍🔬 Your collaborators"] <--> brain
-    slack["💬 Slack and mailing lists"] --> brain
+    slack["💬 Slack, mailing lists and GitHub"] --> brain
     brain(("🧠 collaude"))
     style brain fill:#f5e6ff,stroke:#8b5cf6,stroke-width:2px
 ```
@@ -46,7 +46,7 @@ A memory belongs to a *group*. A group can be just you, a project, or a whole la
 
 **🔒 Private by default.** Groups are closed. The database itself enforces who can read what, so another group's memories never reach your session. Type `#offrecord` in any message and that session is never recorded.
 
-**💬 Slack and email too.** Connect your group's channels and mailing lists, and the decisions buried in long threads become searchable memories that link back to the original messages.
+**💬 Slack, email and GitHub too.** Connect your group's channels, mailing lists and repos, and the decisions buried in long threads and issue discussions become searchable memories that link back to the original messages.
 
 **🐘 Runs on plain Postgres.** It needs no extensions and no vendor lock-in. Run it on a laptop, on your own server, or with any hosted Postgres provider.
 
@@ -112,21 +112,38 @@ collaude status
 
 Memory kinds: `finding`, `dead_end`, `decision`, `method`, `data_note`, `gotcha`, `question`, `other`.
 
-## Bring in Slack and email
+## Bring in Slack, email and GitHub
 
-Connectors pull messages from the channels and mail folders you choose, wait until a thread has gone quiet, and then distil it into memories that cite the original messages. Everything is set up from the command line, which checks your credentials before it saves anything.
+Connectors pull messages from the channels, mail folders and repos you choose, wait until a thread has gone quiet, and then distil it into memories that cite the original messages. Everything is set up from the command line, which checks your credentials before it saves anything.
 
 ```sh
 collaude connector slack-manifest        # create the Slack app from this manifest
 collaude connector add slack             # paste the bot token, then choose a group for each channel
 collaude connector add email --host imap.example.org --user lists@example.org
 collaude connector add email --oauth --user me@example.org --oauth-client-file client_secret.json   # Gmail
+collaude connector add github            # press Enter to use your gh login, then name the repos
 
 collaude connector list                  # what's connected, last sync, any errors
 collaude search --messages "zero point"  # search the raw messages
 ```
 
 Catch-up runs in the background whenever someone who holds the credentials starts a Claude session, so no server is needed. A lease in the database makes sure only one machine runs a connector at a time. Re-fetching a message never stores it twice, and a thread or channel that fails never blocks the others.
+
+<details>
+<summary><b>GitHub</b></summary>
+
+Each issue or pull request is a thread: its opening post, its comments and its code-review comments. Bots such as Dependabot and CI are skipped.
+
+At the token prompt, press Enter to use your [`gh`](https://cli.github.com/) login. collaude then asks `gh` for a token on each run and keeps no copy. Or paste a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with read-only *Issues* and *Pull requests* access to the repos you want to share.
+
+```sh
+collaude connector add github --route 'my-org/analysis=my-group'
+collaude connector route github https://github.com/my-org/paper my-group --backfill-days 60
+```
+
+Without `--route`, you're asked for `owner/repo=group` lines. `collaude connector sources github` lists every repo the token can see.
+
+</details>
 
 <details>
 <summary><b>Gmail and Google Workspace</b></summary>
@@ -236,7 +253,7 @@ When you're ready to share, run it on a server your collaborators can reach (on 
 ## Roadmap
 
 - **Meaning-based search** with `pgvector`, blended with full-text ranking.
-- **More connectors:** GitHub issues and PRs, arXiv and ADS alerts, document comments. A connector is a small class in `bin/collaude_connectors.py`.
+- **More connectors:** arXiv and ADS alerts, GitHub Discussions, document comments. A connector is a small class in `bin/collaude_connectors.py`.
 - **Several groups per folder.** Today a folder belongs to one group, and other groups are reachable with `--all-groups`.
 
 Removing someone from a group stops what they can read from then on, but it can't take back what they've already seen. Extraction quality depends on `prompts/extract.md`, so tune it for your field. Each memory records the extractor version that wrote it.

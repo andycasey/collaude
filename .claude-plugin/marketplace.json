@@ -1,0 +1,15 @@
+{
+  "name": "collaude",
+  "description": "Shared, searchable team memory for Claude Code",
+  "owner": {
+    "name": "acasey",
+    "email": "acasey@flatironinstitute.org"
+  },
+  "plugins": [
+    {
+      "name": "collaude",
+      "source": "./plugins/collaude",
+      "description": "Shared, searchable team memory for Claude Code, stored in PostgreSQL"
+    }
+  ]
+}

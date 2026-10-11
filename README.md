@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo.svg" alt="collaude logo" width="140">
+
 # collaude
 
 ### One memory for every Claude you run.

@@ -1,6 +1,6 @@
 {
   "name": "collaude",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Shared team memory for Claude Code: captures what is worth knowing from sessions into a PostgreSQL database your collaborators can search",
   "author": {
     "name": "Andy Casey"

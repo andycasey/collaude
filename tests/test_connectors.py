@@ -775,3 +775,59 @@ def test_rename_connector(db, slack, as_user, monkeypatch, capsys):
     cl.main(["ingest", "--max-threads", "0"])
     assert "stars-slack:" in capsys.readouterr().out
     assert json.loads(cl.SECRETS_FILE.read_text()) == {"stars-slack": "xoxb-test"}
+
+
+@needs_db
+def test_one_channel_feeds_several_groups(db, slack, as_user, monkeypatch, capsys):
+    as_user("carol")  # in g1 and g2
+    monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+    cl.main(["connector", "add", "slack", "--name", "shared", "--secret-env", "SLACK_TOKEN",
+             "--route", "#clump-rotation=g1,g2"])
+    out = capsys.readouterr().out
+    assert "#clump-rotation -> g1 (backfilling 14 days)" in out and "#clump-rotation -> g2 as well" in out
+
+    as_user("alice")  # only in g1, but she holds the credentials too and runs the ingest
+    cl.main(["connector", "login", "shared", "--secret-env", "SLACK_TOKEN"])
+    cl.main(["connector", "route", "shared", "#clump-rotation", "g1"])
+    assert "only the creator of connector shared can route it" in capsys.readouterr().out
+    cl.main(["ingest", "shared"])
+    out = capsys.readouterr().out
+    assert "fetching #clump-rotation -> g1, g2" in out and "shared: 3 new messages, 1 new memories" in out
+
+    with cl.connect(db["bob"]) as conn:  # g2 sees the messages and the memory, each stored once
+        hits = cl.search_sources(conn, "zero-point", None)
+        assert len(hits) == 1 and hits[0]["group_ids"] == ["g1", "g2"]
+        mems = cl.search_memories(conn, "Lindegren", None)
+        assert len(mems) == 1 and mems[0]["group_ids"] == ["g1", "g2"] and mems[0]["author"].endswith("_alice")
+        assert "groups g1, g2" in cl.format_memory(mems[0])
+        shared_memory = mems[0]["id"]
+
+    as_user("bob")  # stops the channel feeding g2; it keeps feeding g1
+    cl.main(["connector", "unroute", "shared", "#clump-rotation"])
+    assert "no longer feeds your groups" in capsys.readouterr().out
+    with cl.connect(db["carol"]) as conn:
+        assert conn.execute("select group_ids from collaude.connector_routes "
+                            "where connector_id = 'shared'").fetchall() == [(["g1"],)]
+    with cl.connect(db["bob"]) as conn:  # what was already shared stays shared
+        assert cl.search_sources(conn, "zero-point", None)
+
+    slack.add_reply("C0STARS1", f"{NOW - 3 * DAY:.6f}", "U2",
+                    "Update from Bob: the zero-point offset depends on G magnitude, use the full recipe.",
+                    NOW - 3 * 3600)
+    as_user("alice")
+    cl.main(["ingest", "shared"])
+    assert "shared: 1 new messages, 1 new memories" in capsys.readouterr().out
+    with cl.connect(db["bob"]) as conn:
+        assert not cl.search_sources(conn, "magnitude", None)
+        assert [m["id"] for m in cl.search_memories(conn, "zero point", None)] == [shared_memory]
+
+    # Routing g2 back in shares what was ingested meanwhile, and the memories made only from it.
+    as_user("carol")
+    cl.main(["connector", "route", "shared", "#clump-rotation", "g2"])
+    out = capsys.readouterr().out
+    assert "#clump-rotation -> g2 as well (sharing what was ingested in the last 14 days)" in out
+    cl.main(["connector", "route", "shared", "#clump-rotation", "g2"])
+    assert "#clump-rotation already feeds g2" in capsys.readouterr().out
+    with cl.connect(db["bob"]) as conn:
+        assert cl.search_sources(conn, "magnitude", None)[0]["group_ids"] == ["g1", "g2"]
+        assert {m["id"] for m in cl.search_memories(conn, "magnitude", None)} - {shared_memory}

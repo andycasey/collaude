@@ -5,7 +5,7 @@ description: Search, read, and curate the group's shared research memory (collau
 
 # Team memory (collaude)
 
-Collaborators' Claude Code sessions, and the group's connected Slack channels and mailing lists, automatically produce short memories (findings, dead ends, decisions, methods, data caveats, gotchas, open questions) in a shared PostgreSQL database. A folder belongs to a group through a `.collaude.json` file at or above it. Everyone in the group can read the group's memories.
+Collaborators' Claude Code sessions, and the group's connected Slack channels and mailing lists, automatically produce short memories (findings, dead ends, decisions, methods, data caveats, gotchas, open questions) in a shared PostgreSQL database. A folder belongs to one or more groups through a `.collaude.json` file at or above it. A memory is shared with one or more groups, and everyone in any of them can read it.
 
 Run the CLI through Bash. The session-start context gives the exact command; it has the form:
 
@@ -18,8 +18,9 @@ uv run --quiet --script <plugin>/bin/collaude.py <subcommand>
 Before digging into a dataset, method, bug, or result, search for what the group already knows:
 
 ```
-collaude search "<a few distinctive terms>"        # this folder's group
+collaude search "<a few distinctive terms>"        # this folder's groups
 collaude search "<terms>" --all-groups             # every group the user belongs to
+collaude search "<terms>" -g <group> -g <group>    # particular groups
 collaude search "<terms>" --kind dead_end          # finding, dead_end, decision, method, data_note, gotcha, question
 collaude search "<terms>" --author <name> --since 2026-09-01
 collaude recent -n 20
@@ -49,6 +50,7 @@ Capture is automatic at session end and before compaction, so do not add memorie
 
 ```
 collaude add --kind finding --title "<specific title>" --body "<1-4 self-contained sentences>" --tags a,b --confidence high
+collaude add ... -g <group> -g <group>            # share with particular groups (default: this folder's)
 collaude add ... --supersedes <old id>            # a newer result replaces an older one
 collaude supersede <old id> --by <new id> --note "<why>"
 collaude retract <id> --reason "<why it was wrong>"
@@ -62,4 +64,4 @@ If the user writes `#offrecord` anywhere in a message, nothing from that session
 
 ## Connecting Slack or email
 
-Connectors are set up with `collaude connector ...`. Adding one asks for a token or password, so the user should run `collaude connector add slack` or `collaude connector add email --host <imap host> --user <login>` in a separate terminal window, since it prompts for the secret without echoing it; never ask them to paste a secret into the conversation. `collaude connector list` shows what is connected, which group each channel or folder feeds, and when it last synced. Ingest runs in the background when a session starts on a machine that holds the credentials; `collaude ingest` runs it immediately.
+Connectors are set up with `collaude connector ...`. Adding one asks for a token or password, so the user should run `collaude connector add slack` or `collaude connector add email --host <imap host> --user <login>` in a separate terminal window, since it prompts for the secret without echoing it; never ask them to paste a secret into the conversation. `collaude connector list` shows what is connected, which groups each channel or folder feeds, and when it last synced. One channel can feed several groups (`collaude connector route <name> '#channel' <group> <group>`). Ingest runs in the background when a session starts on a machine that holds the credentials; `collaude ingest` runs it immediately.

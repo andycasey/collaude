@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 SCRIPT = Path(__file__).resolve()
 PLUGIN_ROOT = SCRIPT.parent.parent
 SQL_DIR = PLUGIN_ROOT / "sql"
@@ -99,6 +99,21 @@ def user_dsn() -> str | None:
     return os.environ.get("COLLAUDE_DSN") or load_user_config().get("dsn")
 
 
+def project_groups(cfg: dict) -> list[str]:
+    """The groups a .collaude.json shares with: "groups": [...], or the older "group": "..."."""
+    raw = cfg.get("groups") if "groups" in cfg else cfg.get("group")
+    raw = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    return list(dict.fromkeys(g.strip() for g in raw if isinstance(g, str) and g.strip()))
+
+
+def _as_groups(groups: str | list[str]) -> list[str]:
+    return [groups] if isinstance(groups, str) else list(dict.fromkeys(groups))
+
+
+def _groups_label(groups: list[str]) -> str:
+    return f"group {groups[0]}" if len(groups) == 1 else f"groups {', '.join(groups)}"
+
+
 def find_project(start: str | os.PathLike | None = None) -> tuple[Path, dict] | None:
     """Find the nearest .collaude.json at or above `start`."""
     d = Path(start or os.getcwd()).resolve()
@@ -109,7 +124,7 @@ def find_project(start: str | os.PathLike | None = None) -> tuple[Path, dict] | 
                 cfg = json.loads(f.read_text())
             except json.JSONDecodeError:
                 return None
-            if isinstance(cfg, dict) and cfg.get("group"):
+            if isinstance(cfg, dict) and project_groups(cfg):
                 return p, cfg
             return None
     return None
@@ -351,8 +366,8 @@ def fetch_recent(conn, groups: list[str] | None, limit: int, include_inactive=Fa
 
     where, params = ["true"], {"limit": limit}
     if groups:
-        where.append("m.group_id = any(%(groups)s)")
-        params["groups"] = groups
+        where.append("m.group_ids && %(groups)s::text[]")
+        params["groups"] = list(groups)
     if not include_inactive:
         where.append("m.status = 'active'")
     with conn.cursor(row_factory=dict_row) as cur:
@@ -374,8 +389,8 @@ def search_memories(conn, query: str, groups: list[str] | None, limit: int = 10,
     params = {"q": query, "orq": " | ".join(words), "limit": limit}
     where = ["m.search @@ q.or_q"]
     if groups:
-        where.append("m.group_id = any(%(groups)s)")
-        params["groups"] = groups
+        where.append("m.group_ids && %(groups)s::text[]")
+        params["groups"] = list(groups)
     if not include_inactive:
         where.append("m.status = 'active'")
     if kind:
@@ -403,22 +418,22 @@ def search_memories(conn, query: str, groups: list[str] | None, limit: int = 10,
         return cur.fetchall()
 
 
-def insert_session(conn, session_id: str, group: str, cwd: str, transcript_path: str | None) -> None:
+def insert_session(conn, session_id: str, groups: str | list[str], cwd: str, transcript_path: str | None) -> None:
     info = git_info(cwd)
     conn.execute("""
-        insert into collaude.sessions (id, group_id, host, cwd, repo, branch, commit_sha, transcript_path, client_version)
+        insert into collaude.sessions (id, group_ids, host, cwd, repo, branch, commit_sha, transcript_path, client_version)
         values (%s, %s, %s, %s, %s, %s, %s, %s, %s) on conflict (id) do nothing""",
-        (session_id, group, socket.gethostname(), cwd, info["repo"], info["branch"], info["commit_sha"],
+        (session_id, _as_groups(groups), socket.gethostname(), cwd, info["repo"], info["branch"], info["commit_sha"],
          transcript_path, f"collaude/{VERSION}"))
 
 
-def insert_memory(conn, group: str, m: dict, session_id: str | None, origin: str, extractor: str | None,
+def insert_memory(conn, groups: str | list[str], m: dict, session_id: str | None, origin: str, extractor: str | None,
                   source_time: datetime | None = None) -> int:
     row = conn.execute("""
         insert into collaude.memories
-          (group_id, kind, title, body, tags, confidence, evidence_quote, origin, session_id, extractor, source_time)
+          (group_ids, kind, title, body, tags, confidence, evidence_quote, origin, session_id, extractor, source_time)
         values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) returning id""",
-        (group, m["kind"], m["title"], m["body"], m["tags"], m["confidence"], m.get("evidence_quote"),
+        (_as_groups(groups), m["kind"], m["title"], m["body"], m["tags"], m["confidence"], m.get("evidence_quote"),
          origin, session_id, extractor, source_time)).fetchone()
     new_id = row[0]
     for sid in m.get("source_ids") or []:
@@ -426,6 +441,11 @@ def insert_memory(conn, group: str, m: dict, session_id: str | None, origin: str
     if m.get("supersedes"):
         set_status(conn, m["supersedes"], "superseded", superseded_by=new_id, note=f"superseded by #{new_id}")
     return new_id
+
+
+def _supersedable(existing: list[dict], groups: list[str]) -> set[int]:
+    """Memories a new one shared with `groups` may replace: only those it is visible to everyone of."""
+    return {m["id"] for m in existing if set(m["group_ids"]) <= set(groups)}
 
 
 def set_status(conn, memory_id: int, status: str, superseded_by: int | None = None, note: str | None = None) -> bool:
@@ -460,7 +480,7 @@ def _when(m: dict) -> datetime:
 def format_memory(m: dict, full=False) -> str:
     flag = "" if m["status"] == "active" else f" ({m['status'].upper()})"
     head = (f"#{m['id']} [{m['kind']}] {m['title']}{flag}\n"
-            f"    {_attribution(m)} · {_when(m):%Y-%m-%d} ({_age(_when(m))}) · group {m['group_id']}"
+            f"    {_attribution(m)} · {_when(m):%Y-%m-%d} ({_age(_when(m))}) · {_groups_label(m['group_ids'])}"
             f" · confidence {m['confidence']}")
     body = m["body"] if full else _clip(m["body"], 400)
     lines = [head, textwrap.indent(textwrap.fill(body, 96), "    ")]
@@ -507,25 +527,30 @@ def hook_session_start(_args) -> None:
     if not found or not user_dsn():
         return
     _, proj = found
-    group = proj["group"]
+    groups = project_groups(proj)
     try:
         n_recent = max(0, int(proj.get("recent_on_start", 8)))
     except (TypeError, ValueError):
         n_recent = 8
     try:
         with connect(timeout=4) as conn:
-            recent = fetch_recent(conn, [group], n_recent)
+            recent = fetch_recent(conn, groups, n_recent)
     except Exception as e:  # never block a session on the memory server
         log(f"session-start: {e!r}")
         return
     cmd = self_command()
-    lines = [f'Team memory (collaude) is active: this folder belongs to group "{group}". '
-             f"Memories are captured automatically from sessions and shared with the group."]
+    if len(groups) == 1:
+        lines = [f'Team memory (collaude) is active: this folder belongs to group "{groups[0]}". '
+                 f"Memories are captured automatically from sessions and shared with the group."]
+    else:
+        named = ", ".join(f'"{g}"' for g in groups)
+        lines = [f"Team memory (collaude) is active: this folder belongs to groups {named}. "
+                 f"Memories are captured automatically from sessions and shared with all of them."]
     if recent:
         lines.append("Most recent shared memories:")
         lines += [f"  #{m['id']} [{m['kind']}] {m['title']} ({_attribution(m)}, {_age(_when(m))})" for m in recent]
     else:
-        lines.append("No memories in this group yet.")
+        lines.append(f"No memories in {'this group' if len(groups) == 1 else 'these groups'} yet.")
     lines.append(f"Search before investigating something a collaborator may already have looked at: "
                  f'`{cmd} search "<terms>"`; full text and provenance: `{cmd} show <id>`.')
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "\n".join(lines)}}))
@@ -581,7 +606,8 @@ def capture_worker(args) -> None:
     if not found:
         return
     _, proj = found
-    group = proj["group"]
+    groups = project_groups(proj)
+    group = ",".join(groups)  # for log lines
 
     (STATE_DIR / "offsets").mkdir(parents=True, exist_ok=True)
     offset_file = STATE_DIR / "offsets" / f"{session_id}.json"
@@ -611,16 +637,24 @@ def capture_worker(args) -> None:
         try:
             # Two short connections, so no transaction stays open while the extractor runs.
             with connect() as conn:
-                existing = fetch_recent(conn, [group], 80)
-            raw = run_extractor(build_prompt(text, existing, group))
-            memories = parse_memories(raw, text, {m["id"] for m in existing})
+                # A folder shared with several groups captures into the ones this person is in.
+                mine = set(_my_groups(conn))
+                writable = [g for g in groups if g in mine]
+                if not writable:
+                    log(f"capture {session_id[:8]} [{group}] waiting: you are not in "
+                        f"{'this group' if len(groups) == 1 else 'any of these groups'}")
+                    return
+                existing = fetch_recent(conn, writable, 80)
+            raw = run_extractor(build_prompt(text, existing, ", ".join(writable)))
+            memories = parse_memories(raw, text, _supersedable(existing, writable))
             with connect() as conn:
                 if memories:
-                    insert_session(conn, session_id, group, cwd, transcript_path)
+                    insert_session(conn, session_id, writable, cwd, transcript_path)
                     if proj.get("share_excerpts"):
                         conn.execute("insert into collaude.excerpts (session_id, content) values (%s, %s)",
                                      (session_id, text))
-                    ids = [insert_memory(conn, group, m, session_id, "claude-code", EXTRACTOR_ID) for m in memories]
+                    ids = [insert_memory(conn, writable, m, session_id, "claude-code", EXTRACTOR_ID)
+                           for m in memories]
                 conn.commit()
         except Exception as e:
             log(f"capture {session_id[:8]} [{group}] failed, will retry next time: {e!r}")
@@ -635,10 +669,10 @@ def _groups_for(args, conn=None) -> list[str] | None:
     if getattr(args, "all_groups", False):
         return None
     if getattr(args, "group", None):
-        return [args.group]
+        return list(dict.fromkeys(args.group))
     found = find_project()
     if found:
-        return [found[1]["group"]]
+        return project_groups(found[1])
     return None  # outside a project: everything you can see
 
 
@@ -662,16 +696,27 @@ def cmd_setup(args) -> None:
 def cmd_init(args) -> None:
     target = Path.cwd() / PROJECT_FILE
     if target.exists() and not args.force:
-        sys.exit(f"collaude: {target} already exists (use --force to overwrite)")
+        sys.exit(f"collaude: {target} already exists (use --force to replace its groups)")
+    wanted = list(dict.fromkeys(args.group))
     with connect() as conn:
-        groups = [r[0] for r in conn.execute("select collaude.my_groups()")]
-    if args.group not in groups:
-        sys.exit(f"collaude: you are not a member of group {args.group!r}; your groups: {', '.join(groups) or 'none'}")
-    cfg = {"group": args.group}
+        groups = _my_groups(conn)
+    missing = [g for g in wanted if g not in groups]
+    if missing:
+        sys.exit(f"collaude: you are not a member of {', '.join(map(repr, missing))}; "
+                 f"your groups: {', '.join(groups) or 'none'}")
+    cfg = {}
+    if target.exists():  # --force: keep the folder's other settings
+        try:
+            old = json.loads(target.read_text())
+            cfg = {k: v for k, v in old.items() if k not in ("group", "groups")} if isinstance(old, dict) else {}
+        except json.JSONDecodeError:
+            pass
+    # A single group is still written as "group", which clients before 0.4 also understand.
+    cfg = {**({"group": wanted[0]} if len(wanted) == 1 else {"groups": wanted}), **cfg}
     if args.share_excerpts:
         cfg["share_excerpts"] = True
     target.write_text(json.dumps(cfg, indent=2) + "\n")
-    print(f"Wrote {target}. Commit it so collaborators' sessions in this folder use group {args.group!r}.")
+    print(f"Wrote {target}. Commit it so collaborators' sessions in this folder use {_groups_label(wanted)}.")
 
 
 def cmd_status(args) -> None:
@@ -687,14 +732,14 @@ def cmd_status(args) -> None:
         member = conn.execute("select email, display_name, active from collaude.members where role_name = %s",
                               (me,)).fetchone()
         groups = conn.execute("""
-            select g.id, g.name, (select count(*) from collaude.memories m where m.group_id = g.id)
+            select g.id, g.name, (select count(*) from collaude.memories m where g.id = any(m.group_ids))
             from collaude.groups g order by g.id""").fetchall()
     print(f"you:     {me}" + (f" <{member[0]}>" if member and member[0] else "")
           + ("" if not member or member[2] else " (DEACTIVATED)"))
     for gid, name, n in groups:
         print(f"group:   {gid} ({name}), {n} memories")
     found = find_project()
-    print(f"project: {found[0] / PROJECT_FILE} -> group {found[1]['group']}" if found
+    print(f"project: {found[0] / PROJECT_FILE} -> {_groups_label(project_groups(found[1]))}" if found
           else "project: none (no .collaude.json here or above)")
 
 
@@ -746,7 +791,7 @@ def cmd_show(args) -> None:
                     (m["session_id"],))
         excerpts = cur.fetchall()
         cur.execute("""select s.id, s.origin, s.container, s.author_name, s.source_time, s.permalink, s.subject,
-                              s.content, s.group_id
+                              s.content, s.group_ids
                        from collaude.memory_sources ms join collaude.sources s on s.id = ms.source_id
                        where ms.memory_id = %s order by s.source_time""", (m["id"],))
         sources = cur.fetchall()
@@ -791,16 +836,16 @@ def cmd_show(args) -> None:
 
 
 def cmd_add(args) -> None:
-    group = args.group or (find_project() or (None, {}))[1].get("group")
-    if not group:
+    groups = list(dict.fromkeys(args.group or [])) or project_groups((find_project() or (None, {}))[1])
+    if not groups:
         sys.exit("collaude: no group; pass --group or run inside a folder with .collaude.json")
     m = {"title": args.title, "body": args.body, "kind": args.kind, "confidence": args.confidence,
          "tags": [t.strip().lower() for t in (args.tags or "").split(",") if t.strip()],
          "supersedes": args.supersedes}
     with connect() as conn:
-        new_id = insert_memory(conn, group, m, None, "manual", None)
+        new_id = insert_memory(conn, groups, m, None, "manual", None)
         conn.commit()
-    print(f"Stored #{new_id} in group {group}.")
+    print(f"Stored #{new_id} in {_groups_label(groups)}.")
 
 
 def cmd_supersede(args) -> None:
@@ -928,27 +973,38 @@ def _connector_impl(conn, cid: str, secret: str | None = None):
 
 
 def _add_routes(conn, impl, cid: str, pairs: list[tuple[str, str]], backfill_days: int) -> int:
+    """Feed each SOURCE into GROUP. A source can feed several groups; it is fetched once for all of them."""
+    import psycopg
+
     cc = _connectors_mod()
     groups = _my_groups(conn)
     added = 0
+    resolved: dict[str, tuple[str, str]] = {}
     for src, group in pairs:
         if group not in groups:
             print(f"  skipped {src}: you are not in group {group!r} (yours: {', '.join(groups)})")
             continue
         try:
-            key, label = impl.resolve(src)
+            key, label = resolved[src] if src in resolved else impl.resolve(src)
         except cc.ConnectorError as e:
             print(f"  skipped {src}: {e}")
             continue
-        cur = conn.execute("""
-            insert into collaude.connector_routes (connector_id, source_key, source_label, group_id, backfill_from)
-            values (%s, %s, %s, %s, now() - make_interval(days => %s))
-            on conflict (connector_id, source_key) do nothing""", (cid, key, label, group, backfill_days))
-        if cur.rowcount:
-            added += 1
+        resolved[src] = (key, label)
+        try:
+            with conn.transaction():
+                outcome = conn.execute("select collaude.route_source(%s, %s, %s, %s, make_interval(days => %s))",
+                                       (cid, key, label, group, backfill_days)).fetchone()[0]
+        except psycopg.errors.InsufficientPrivilege as e:
+            print(f"  skipped {label}: {e.diag.message_primary}")
+            continue
+        if outcome == "already":
+            print(f"  {label} already feeds {group}")
+            continue
+        added += 1
+        if outcome == "added":
             print(f"  {label} -> {group} (backfilling {backfill_days} days)")
         else:
-            print(f"  {label} is already routed; `collaude connector unroute {cid} '{label}'` first to change it")
+            print(f"  {label} -> {group} as well (sharing what was ingested in the last {backfill_days} days)")
     return added
 
 
@@ -959,31 +1015,34 @@ def _ask_routes(impl, groups: list[str]) -> list[tuple[str, str]]:
         return []
     if len(sources) > 25:  # e.g. every repo a GitHub account can see: ask by name instead
         print(f"The credentials can see {len(sources)} sources (`collaude connector sources <name>` lists them).")
-        print(f"Enter SOURCE=GROUP, one per line, then an empty line. Your groups: {', '.join(groups)}.")
+        print(f"Enter SOURCE=GROUP[,GROUP...], one per line, then an empty line. Your groups: {', '.join(groups)}.")
         pairs = []
         while answer := input("  ").strip():
-            src, sep, group = answer.rpartition("=")
-            if sep and src and group:
-                pairs.append((src.strip(), group.strip()))
+            src, sep, wanted = answer.rpartition("=")
+            if sep and src and _split_groups(wanted):
+                pairs += [(src.strip(), g) for g in _split_groups(wanted)]
             else:
                 print("  expected SOURCE=GROUP, e.g. owner/repo=my-group")
         return pairs
-    print(f"Which group should each one feed? Your groups: {', '.join(groups)}. Press Enter to skip.")
+    print(f"Which groups should each one feed (comma-separated)? Your groups: {', '.join(groups)}. "
+          f"Press Enter to skip.")
     pairs = []
     for key, label in sources:
-        answer = input(f"  {label}: ").strip()
-        if answer:
-            pairs.append((key, answer))
+        pairs += [(key, g) for g in _split_groups(input(f"  {label}: "))]
     return pairs
+
+
+def _split_groups(text: str) -> list[str]:
+    return list(dict.fromkeys(g.strip() for g in text.split(",") if g.strip()))
 
 
 def _route_args(values: list[str] | None) -> list[tuple[str, str]]:
     pairs = []
     for v in values or []:
-        src, sep, group = v.rpartition("=")
-        if not sep or not src or not group:
-            sys.exit(f"collaude: --route expects SOURCE=GROUP, got {v!r}")
-        pairs.append((src, group))
+        src, sep, wanted = v.rpartition("=")
+        if not sep or not src or not _split_groups(wanted):
+            sys.exit(f"collaude: --route expects SOURCE=GROUP[,GROUP...], got {v!r}")
+        pairs += [(src, g) for g in _split_groups(wanted)]
     return pairs
 
 
@@ -1040,26 +1099,29 @@ def cmd_connector_add(args) -> None:
 def cmd_connector_route(args) -> None:
     with connect() as conn:
         impl = _connector_impl(conn, args.name)
-        _add_routes(conn, impl, args.name, [(args.source, args.group)], args.backfill_days)
+        _add_routes(conn, impl, args.name, [(args.source, g) for g in args.group], args.backfill_days)
         conn.commit()
 
 
 def cmd_connector_unroute(args) -> None:
     with connect() as conn:
-        cur = conn.execute("""delete from collaude.connector_routes
-                              where connector_id = %s and (source_key = %s or source_label = %s)""",
-                           (args.name, args.source, args.source))
+        n = conn.execute("select collaude.unroute_source(%s, %s, %s)",
+                         (args.name, args.source, args.group)).fetchone()[0]
         conn.commit()
-    print(f"removed {cur.rowcount} route(s); messages already ingested stay searchable")
+    where = f"group {args.group}" if args.group else "your groups"
+    if n:
+        print(f"{args.source} no longer feeds {where}; messages already ingested stay searchable")
+    else:
+        print(f"collaude: {args.source} of {args.name!r} isn't feeding {where}")
 
 
 def cmd_connector_sources(args) -> None:
     with connect() as conn:
         impl = _connector_impl(conn, args.name)
-        routed = dict(conn.execute("select source_key, group_id from collaude.connector_routes where connector_id = %s",
-                                   (args.name,)).fetchall())
+        routed = dict(conn.execute("select source_key, group_ids from collaude.connector_routes "
+                                   "where connector_id = %s", (args.name,)).fetchall())
     for key, label in impl.list_sources():
-        print(f"{label:40} {'-> ' + routed[key] if key in routed else ''}")
+        print(f"{label:40} {'-> ' + ', '.join(routed[key]) if key in routed else ''}")
 
 
 def cmd_connector_login(args) -> None:
@@ -1110,7 +1172,7 @@ def cmd_connector_list(args) -> None:
             print(f"    running now ({c['lease_holder']})")
         for r in (r for r in routes if r["connector_id"] == c["id"]):
             synced = f"synced {_age(r['last_synced_at'])}" if r["last_synced_at"] else "not synced yet"
-            print(f"    {r['source_label'] or r['source_key']:32} -> {r['group_id']:16} {synced}, "
+            print(f"    {r['source_label'] or r['source_key']:32} -> {', '.join(r['group_ids']):16} {synced}, "
                   f"{r['messages']} messages, {r['memories']} memories")
 
 
@@ -1128,7 +1190,7 @@ def cmd_connector_remove(args) -> None:
         row = conn.execute("select created_by from collaude.connectors where id = %s", (args.name,)).fetchone()
         if not row:
             sys.exit(f"collaude: no connector {args.name!r}")
-        conn.execute("delete from collaude.connector_routes where connector_id = %s", (args.name,))
+        conn.execute("select collaude.unroute_source(%s, null, null)", (args.name,))
         if row[0] == _whoami(conn):
             has_sources = conn.execute("select exists (select 1 from collaude.sources where connector_id = %s)",
                                        (args.name,)).fetchone()[0]
@@ -1203,14 +1265,14 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
                      say=_silent) -> tuple[str, str | None]:
     """Fetch every route, then distil. Returns (summary, error); one failing route doesn't stop the rest."""
     impl = _connectors_mod().make(kind, settings, secret)
-    routes = conn.execute("""select source_key, source_label, group_id, cursor, backfill_from
+    routes = conn.execute("""select source_key, source_label, group_ids, cursor, backfill_from
                              from collaude.connector_routes where connector_id = %s order by source_key""",
                           (cid,)).fetchall()
     conn.commit()  # end the read before talking to the remote service
     fetched, errors = 0, []
-    for key, label, group, cursor, backfill in routes:
+    for key, label, groups, cursor, backfill in routes:
         _renew_lease(conn, cid)
-        say(f"  fetching {label or key} -> {group} ...")
+        say(f"  fetching {label or key} -> {', '.join(groups)} ...")
         try:
             items, new_cursor = impl.fetch(key, cursor, backfill, label)
         except Exception as e:
@@ -1222,11 +1284,11 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
         for it in items:
             cur = conn.execute("""
                 insert into collaude.sources
-                  (connector_id, source_key, group_id, origin, external_id, thread_key, container,
+                  (connector_id, source_key, group_ids, origin, external_id, thread_key, container,
                    author_name, author_handle, source_time, permalink, subject, content)
                 values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 on conflict (connector_id, external_id) do nothing""",
-                (cid, key, group, impl.origin, it["external_id"], it["thread_key"], it["container"],
+                (cid, key, groups, impl.origin, it["external_id"], it["thread_key"], it["container"],
                  it["author_name"], it["author_handle"], it["source_time"], it["permalink"], it["subject"],
                  redact(it["content"])))
             fetched += cur.rowcount
@@ -1263,30 +1325,32 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
             with pending as (
-              select group_id, thread_key, min(source_time) as first_time
+              select group_ids, thread_key, min(source_time) as first_time
               from collaude.sources
               where connector_id = %(c)s and distilled_at is null
-              group by group_id, thread_key
+              group by group_ids, thread_key
               having max(source_time) < now() - make_interval(secs => %(quiet)s * 3600)
               order by min(source_time)
               limit %(n)s)
-            select s.id, s.group_id, s.thread_key, s.container, s.author_name, s.source_time, s.subject,
+            -- Context is earlier messages of the thread that every group of the new ones can read.
+            select s.id, p.group_ids, s.thread_key, s.container, s.author_name, s.source_time, s.subject,
                    s.content, s.distilled_at is not null as is_context
-            from collaude.sources s join pending p using (group_id, thread_key)
-            where s.connector_id = %(c)s
-            order by s.group_id, p.first_time, s.thread_key, s.source_time""",
+            from pending p join collaude.sources s
+              on s.connector_id = %(c)s and s.thread_key = p.thread_key
+             and (s.group_ids = p.group_ids or (s.distilled_at is not null and s.group_ids @> p.group_ids))
+            order by p.group_ids, p.first_time, s.thread_key, s.source_time""",
             {"c": cid, "quiet": quiet_hours, "n": max_threads})
         rows = cur.fetchall()
     conn.commit()
 
-    threads: dict[tuple[str, str], list[dict]] = {}
+    threads: dict[tuple[tuple[str, ...], str], list[dict]] = {}
     for r in rows:
-        threads.setdefault((r["group_id"], r["thread_key"]), []).append(r)
+        threads.setdefault((tuple(r["group_ids"]), r["thread_key"]), []).append(r)
 
-    by_group: dict[str, list[list[dict]]] = {}
+    by_group: dict[tuple[str, ...], list[list[dict]]] = {}  # threads shared with the same groups
     for (group, _), msgs in threads.items():
         by_group.setdefault(group, []).append(msgs)
-    batches: list[tuple[str, list[list[dict]]]] = []  # one extractor call each
+    batches: list[tuple[tuple[str, ...], list[list[dict]]]] = []  # one extractor call each
     for group, group_threads in by_group.items():
         batch: list[list[dict]] = []
         size = 0
@@ -1306,25 +1370,36 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
     for i, (group, batch) in enumerate(batches, 1):
         renew()
         t0 = time.time()
-        n = _distill_batch(conn, group, origin, batch)
+        n = _distill_batch(conn, list(group), origin, batch)
         made += n
         say(f"    {i}/{len(batches)}: {len(batch)} threads -> {n} memories ({time.time() - t0:.0f} s)")
     return made
 
 
-def _distill_batch(conn, group: str, origin: str, batch: list[list[dict]]) -> int:
+def _shareable(conn, groups: list[str]) -> list[str]:
+    """`groups` if the database lets you share with all of them (you are in them all, or a route feeds them all);
+    otherwise the ones you are in, e.g. after a route stopped feeding a group you aren't in."""
+    if conn.execute("select collaude.can_share(%s::text[])", (groups,)).fetchone()[0]:
+        return groups
+    mine = set(_my_groups(conn))
+    return [g for g in groups if g in mine]
+
+
+def _distill_batch(conn, groups: list[str], origin: str, batch: list[list[dict]]) -> int:
     new = {m["id"]: m for msgs in batch for m in msgs if not m["is_context"]}
     text = "\n\n".join(_render_thread(msgs) for msgs in batch)
     memories = []
     if sum(len(m["content"]) for m in new.values()) >= 40:  # skip batches that are only "thanks!"
-        existing = fetch_recent(conn, [group], 80)
+        groups = _shareable(conn, groups)
+        existing = fetch_recent(conn, groups, 80) if groups else []
         conn.commit()  # don't hold a transaction open while the extractor runs
         try:
-            raw = run_extractor(build_prompt(text, existing, group, MESSAGES_PROMPT_FILE))
-            memories = parse_memories(raw, text, {m["id"] for m in existing}, set(new))
+            if groups:
+                raw = run_extractor(build_prompt(text, existing, ", ".join(groups), MESSAGES_PROMPT_FILE))
+                memories = parse_memories(raw, text, _supersedable(existing, groups), set(new))
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
             if len(batch) > 1:  # find the thread that fails; let the others through
-                return sum(_distill_batch(conn, group, origin, [msgs]) for msgs in batch)
+                return sum(_distill_batch(conn, groups, origin, [msgs]) for msgs in batch)
             failures = conn.execute("""
                 update collaude.sources set distill_failures = distill_failures + 1,
                        distilled_at = case when distill_failures + 1 >= %s then now() end
@@ -1337,7 +1412,7 @@ def _distill_batch(conn, group: str, origin: str, batch: list[list[dict]]) -> in
             return 0
     for m in memories:
         when = max(new[sid]["source_time"] for sid in m["source_ids"])
-        insert_memory(conn, group, m, None, origin, EXTRACTOR_ID, when)
+        insert_memory(conn, groups, m, None, origin, EXTRACTOR_ID, when)
     conn.execute("update collaude.sources set distilled_at = now() where id = any(%s)", (list(new),))
     conn.commit()
     return len(memories)
@@ -1399,12 +1474,12 @@ def search_sources(conn, query: str, groups: list[str] | None, limit: int = 10) 
     params = {"orq": " | ".join(words), "limit": limit}
     where = ["s.search @@ q.or_q"]
     if groups:
-        where.append("s.group_id = any(%(groups)s)")
-        params["groups"] = groups
+        where.append("s.group_ids && %(groups)s::text[]")
+        params["groups"] = list(groups)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(f"""
             with q as (select to_tsquery('english', %(orq)s) as or_q)
-            select s.id, s.group_id, s.origin, s.container, s.author_name, s.source_time, s.permalink,
+            select s.id, s.group_ids, s.origin, s.container, s.author_name, s.source_time, s.permalink,
                    s.subject, s.content,
                    ts_rank_cd(s.search, q.or_q) / (1 + extract(epoch from now() - s.source_time) / 86400 / 365) as score
             from collaude.sources s cross join q
@@ -1415,7 +1490,7 @@ def search_sources(conn, query: str, groups: list[str] | None, limit: int = 10) 
 
 def format_source(s: dict) -> str:
     head = (f"[S{s['id']}] {s['origin']} {s['container']} · {s['author_name'] or 'unknown'} · "
-            f"{s['source_time']:%Y-%m-%d %H:%M} ({_age(s['source_time'])}) · group {s['group_id']}")
+            f"{s['source_time']:%Y-%m-%d %H:%M} ({_age(s['source_time'])}) · {_groups_label(s['group_ids'])}")
     lines = [head]
     if s.get("subject"):
         lines.append(f"    subject: {s['subject']}")
@@ -1563,7 +1638,8 @@ def main(argv=None) -> None:
         return sp
 
     def scope(sp):
-        sp.add_argument("-g", "--group", help="group to search (default: this folder's group)")
+        sp.add_argument("-g", "--group", action="append",
+                        help="group to search; repeatable (default: this folder's groups)")
         sp.add_argument("-a", "--all-groups", action="store_true", help="search every group you belong to")
         sp.add_argument("-n", "--limit", type=int, default=10)
         sp.add_argument("--include-inactive", action="store_true", help="include superseded/retracted memories")
@@ -1571,11 +1647,11 @@ def main(argv=None) -> None:
 
     sp = add("setup", cmd_setup, "save your database connection string")
     sp.add_argument("--dsn")
-    sp = add("init", cmd_init, "link the current folder to a group (writes .collaude.json)")
-    sp.add_argument("group")
+    sp = add("init", cmd_init, "link the current folder to one or more groups (writes .collaude.json)")
+    sp.add_argument("group", nargs="+")
     sp.add_argument("--share-excerpts", action="store_true",
                     help="also upload condensed transcript excerpts for provenance")
-    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--force", action="store_true", help="replace the groups of an existing .collaude.json")
     add("status", cmd_status, "show connection, identity, and groups")
 
     sp = add("search", cmd_search, "full-text search of shared memories")
@@ -1599,7 +1675,8 @@ def main(argv=None) -> None:
     sp.add_argument("--tags", help="comma-separated")
     sp.add_argument("--confidence", choices=("low", "medium", "high"), default="medium")
     sp.add_argument("--supersedes", type=int)
-    sp.add_argument("-g", "--group")
+    sp.add_argument("-g", "--group", action="append",
+                    help="group to share with; repeatable (default: this folder's groups)")
     sp = add("supersede", cmd_supersede, "mark a memory as replaced by a newer one")
     sp.add_argument("old", type=int)
     sp.add_argument("--by", type=int, required=True)
@@ -1642,27 +1719,28 @@ def main(argv=None) -> None:
     a.add_argument("--oauth", action="store_true",
                    help="sign in to Gmail or Google Workspace in the browser instead of using a password")
     oauth_opt(a)
-    a.add_argument("--route", action="append", metavar="SOURCE=GROUP",
-                   help="'#channel=group', 'folder=group' or 'owner/repo=group'; repeatable. "
+    a.add_argument("--route", action="append", metavar="SOURCE=GROUP[,GROUP...]",
+                   help="'#channel=group', 'folder=g1,g2' or 'owner/repo=group'; repeatable. "
                         "Without it you are asked")
     a.add_argument("--quiet-hours", type=float, help=f"wait this long after a thread's last message before "
                                                      f"distilling it (default {INGEST_QUIET_HOURS:g})")
     secret_opt(a)
     backfill_opt(a)
     a.set_defaults(fn=cmd_connector_add)
-    a = csub.add_parser("route", help="feed a channel, folder or repo into a group")
+    a = csub.add_parser("route", help="feed a channel, folder or repo into one or more groups")
     a.add_argument("name")
     a.add_argument("source", help="'#channel', channel id, mail folder, or owner/repo")
-    a.add_argument("group")
+    a.add_argument("group", nargs="+")
     backfill_opt(a)
     a.set_defaults(fn=cmd_connector_route)
     a = csub.add_parser("rename", help="rename a connector (only its creator, and not while it runs)")
     a.add_argument("old")
     a.add_argument("new")
     a.set_defaults(fn=cmd_connector_rename)
-    a = csub.add_parser("unroute", help="stop feeding a channel or folder")
+    a = csub.add_parser("unroute", help="stop feeding a channel or folder into your groups")
     a.add_argument("name")
     a.add_argument("source")
+    a.add_argument("group", nargs="?", help="only this group (default: every group of yours it feeds)")
     a.set_defaults(fn=cmd_connector_unroute)
     a = csub.add_parser("sources", help="channels/folders the credentials can see")
     a.add_argument("name")

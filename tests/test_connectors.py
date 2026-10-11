@@ -121,6 +121,10 @@ class FakeImap:
         if password != "app-pass":
             raise cc.imaplib.IMAP4.error("AUTHENTICATIONFAILED")
 
+    def authenticate(self, mechanism, authobject):
+        if mechanism != "XOAUTH2" or authobject(b"") != b"user=bot\1auth=Bearer access-1\1\1":
+            raise cc.imaplib.IMAP4.error("AUTHENTICATIONFAILED")
+
     def list(self):
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "lists/stars"',
                       b'(\\Noselect \\HasChildren) "/" "[Gmail]"']
@@ -219,6 +223,96 @@ def test_session_start_spawns_ingest_only_with_credentials(tmp_path, monkeypatch
 
 
 # --- database tests ------------------------------------------------------------------
+
+
+class FakeTokenEndpoint:
+    """Stands in for urlopen against Google's token endpoint."""
+
+    def __init__(self, reply=None, error=None):
+        self.reply, self.error, self.requests = reply or {"access_token": "access-1", "expires_in": 3600}, error, []
+
+    def __call__(self, req, timeout=None):
+        self.requests.append((req.full_url, dict(urllib.parse.parse_qsl(req.data.decode()))))
+        if self.error:
+            raise cc.urllib.error.HTTPError(req.full_url, 400, "Bad Request", {},
+                                            io.BytesIO(json.dumps({"error": self.error}).encode()))
+        return io.BytesIO(json.dumps(self.reply).encode())
+
+
+def test_imap_oauth_refreshes_once_and_logs_in_with_xoauth2(monkeypatch):
+    monkeypatch.setattr(cc.imaplib, "IMAP4_SSL", FakeImap)
+    token = FakeTokenEndpoint()
+    monkeypatch.setattr(cc.urllib.request, "urlopen", token)
+    secret = cc.oauth_secret("client-1", "shh", "refresh-1")
+    conn = cc.ImapConnector({"host": "imap.gmail.com", "user": "bot", "auth": "oauth"}, secret)
+    assert conn.check() == {"web_link": "gmail"}
+    assert conn.list_sources()[0] == ("INBOX", "INBOX")
+    assert token.requests == [(cc.GOOGLE_TOKEN_URL, {"client_id": "client-1", "client_secret": "shh",
+                                                     "refresh_token": "refresh-1", "grant_type": "refresh_token"})]
+    assert cc.xoauth2_string("me@x.org", "T") == "user=me@x.org\x01auth=Bearer T\x01\x01"
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", FakeTokenEndpoint(error="invalid_grant"))
+    with pytest.raises(cc.ConnectorError, match="connector login"):
+        cc.ImapConnector({"host": "imap.gmail.com", "user": "bot", "auth": "oauth"}, secret).check()
+
+
+def test_oauth_redirect_checks_state():
+    assert cc._code_from_redirect("http://127.0.0.1:5000/?state=s1&code=abc&scope=x", "s1") == "abc"
+    assert cc._code_from_redirect("/?code=abc&state=s1", "s1") == "abc"
+    assert cc._code_from_redirect("  abc \n", "s1") == "abc"  # a bare pasted code
+    with pytest.raises(cc.ConnectorError, match="state"):
+        cc._code_from_redirect("/?code=abc&state=forged", "s1")
+    with pytest.raises(cc.ConnectorError, match="access_denied"):
+        cc._code_from_redirect("/?error=access_denied&state=s1", "s1")
+
+
+def test_oauth_authorize_uses_a_loopback_redirect_with_pkce(monkeypatch, capsys):
+    import base64
+    import hashlib
+    import http.client
+
+    seen = {"statuses": []}
+
+    def browser(url):  # Google, after the user signs in, sends the browser back to the loopback server
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        seen.update(q)
+        port = urllib.parse.urlsplit(q["redirect_uri"]).port
+
+        def visit():
+            for state in ("forged", q["state"]):  # a redirect for some other sign-in is ignored
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", f"/?code=code-1&state={state}")
+                seen["statuses"].append(c.getresponse().status)
+        seen["visit"] = threading.Thread(target=visit)
+        seen["visit"].start()
+
+    def token(req, timeout=None):
+        seen["form"] = dict(urllib.parse.parse_qsl(req.data.decode()))
+        return io.BytesIO(json.dumps({"access_token": "a", "refresh_token": "refresh-1"}).encode())
+
+    monkeypatch.setattr(cc.webbrowser, "open", browser)
+    monkeypatch.setattr(cc.urllib.request, "urlopen", token)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert cc.oauth_authorize("client-1", "shh", login_hint="me@x.org", timeout=10) == "refresh-1"
+    seen["visit"].join(5)
+    assert seen["statuses"] == [400, 200]
+    assert seen["scope"] == cc.GMAIL_SCOPE and seen["access_type"] == "offline" and seen["prompt"] == "consent"
+    assert seen["code_challenge_method"] == "S256" and seen["login_hint"] == "me@x.org"
+    form = seen["form"]
+    assert form["code"] == "code-1" and form["grant_type"] == "authorization_code"
+    assert form["redirect_uri"] == seen["redirect_uri"] and form["redirect_uri"].startswith("http://127.0.0.1:")
+    digest = hashlib.sha256(form["code_verifier"].encode()).digest()
+    assert base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == seen["code_challenge"]
+    assert "https://accounts.google.com/" in capsys.readouterr().out  # printed for SSH sessions
+
+
+def test_oauth_client_file(tmp_path):
+    f = tmp_path / "client_secret.json"
+    f.write_text(json.dumps({"installed": {"client_id": "client-1", "client_secret": "shh"}}))
+    assert cc.oauth_client_from_file(f) == ("client-1", "shh")
+    f.write_text("{}")
+    with pytest.raises(cc.ConnectorError, match="Desktop app"):
+        cc.oauth_client_from_file(f)
 
 
 @pytest.fixture
@@ -354,6 +448,41 @@ def test_email_connector_and_distill_cap(db, as_user, monkeypatch, capsys):
     assert "lists" not in json.loads(cl.SECRETS_FILE.read_text())
     with cl.connect(db["bob"]) as conn:  # history kept
         assert len(cl.search_sources(conn, "spectroscopic", ["g2"])) == 3
+
+
+@needs_db
+def test_email_connector_with_oauth(db, as_user, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cc.imaplib, "IMAP4_SSL", FakeImap)
+    FakeImap.mailbox = {"lists/stars": {1: make_mail(201, "priors", "Use the broad prior.", days_ago=1)}}
+    monkeypatch.setattr(cc.urllib.request, "urlopen", FakeTokenEndpoint())
+    signins = []
+    monkeypatch.setattr(cc, "oauth_authorize",
+                        lambda cid, csec, login_hint=None: signins.append((cid, csec, login_hint)) or "refresh-1")
+    client = tmp_path / "client_secret.json"
+    client.write_text(json.dumps({"installed": {"client_id": "client-1", "client_secret": "shh"}}))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    as_user("carol")
+    cl.main(["connector", "add", "email", "--oauth", "--oauth-client-file", str(client), "--name", "gmail",
+             "--user", "bot", "--route", "lists/stars=g2"])
+    assert signins == [("client-1", "shh", "bot")]
+    saved = json.loads(json.loads(cl.SECRETS_FILE.read_text())["gmail"])
+    assert saved == {"client_id": "client-1", "client_secret": "shh", "refresh_token": "refresh-1"}
+    with cl.connect(db["carol"]) as conn:  # the database knows how to sign in, but holds no secrets
+        settings = conn.execute("select settings from collaude.connectors where id = 'gmail'").fetchone()[0]
+    assert settings["auth"] == "oauth" and settings["host"] == "imap.gmail.com"
+    assert "shh" not in json.dumps(settings) and "refresh" not in json.dumps(settings)
+    cl.main(["ingest", "gmail"])
+    assert "gmail: 1 new messages" in capsys.readouterr().out
+
+    as_user("bob")  # a second machine, signing in with the same client
+    cl.main(["connector", "login", "gmail", "--oauth-client-file", str(client)])
+    assert signins[-1] == ("client-1", "shh", "bot") and "gmail" in json.loads(cl.SECRETS_FILE.read_text())
+    cl.main(["connector", "login", "gmail"])  # signing in again reuses the client saved here
+    assert len(signins) == 3
+    monkeypatch.setattr(cl, "SECRETS_FILE", tmp_path / "fresh-secrets.json")
+    with pytest.raises(SystemExit, match="OAuth client"):  # no client given and none saved here
+        cl.main(["connector", "login", "gmail"])
 
 
 @needs_db

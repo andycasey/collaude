@@ -52,6 +52,7 @@ INGEST_STALE_MINUTES = int(os.environ.get("COLLAUDE_INGEST_STALE_MINUTES", "30")
 INGEST_MAX_THREADS = 200
 INGEST_QUIET_HOURS = 2.0
 DISTILL_MAX_FAILURES = 3
+INGEST_LEASE_MINUTES = 30
 
 
 # --- configuration -----------------------------------------------------------
@@ -1043,6 +1044,19 @@ def cmd_slack_manifest(_args) -> None:
     print(json.dumps(_connectors_mod().SLACK_MANIFEST, indent=2))
 
 
+class LeaseLost(Exception):
+    pass
+
+
+def _renew_lease(conn, cid: str) -> None:
+    """Extend this run's lease before the next step; stop if another machine may have taken over."""
+    ok = conn.execute("select collaude.renew_ingest(%s, make_interval(mins => %s))",
+                      (cid, INGEST_LEASE_MINUTES)).fetchone()[0]
+    conn.commit()
+    if not ok:
+        raise LeaseLost(f"lease on {cid} expired; stopping so another run can take over")
+
+
 def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int) -> tuple[str, str | None]:
     """Fetch every route, then distil. Returns (summary, error); one failing route doesn't stop the rest."""
     impl = _connectors_mod().make(kind, settings, secret)
@@ -1052,6 +1066,7 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
     conn.commit()  # end the read before talking to the remote service
     fetched, errors = 0, []
     for key, label, group, cursor, backfill in routes:
+        _renew_lease(conn, cid)
         try:
             items, new_cursor = impl.fetch(key, cursor, backfill, label)
         except Exception as e:
@@ -1072,7 +1087,8 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
         conn.execute("""update collaude.connector_routes set cursor = %s, last_synced_at = now()
                         where connector_id = %s and source_key = %s""", (new_cursor, cid, key))
         conn.commit()
-    made = distill(conn, cid, impl.origin, float(settings.get("quiet_hours", INGEST_QUIET_HOURS)), max_threads)
+    made = distill(conn, cid, impl.origin, float(settings.get("quiet_hours", INGEST_QUIET_HOURS)), max_threads,
+                   renew=lambda: _renew_lease(conn, cid))
     summary = f"{fetched} new messages, {made} new memories"
     if errors:
         summary += f"; {len(errors)} of {len(routes)} sources failed"
@@ -1092,7 +1108,8 @@ def _render_thread(msgs: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, max_chars: int = 60_000) -> int:
+def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, max_chars: int = 60_000,
+            renew=lambda: None) -> int:
     """Turn threads that have gone quiet into memories, oldest first, at most max_threads per run."""
     from psycopg.rows import dict_row
 
@@ -1129,11 +1146,13 @@ def distill(conn, cid: str, origin: str, quiet_hours: float, max_threads: int, m
         for msgs in group_threads:
             text = _render_thread(msgs)
             if batch and size + len(text) > max_chars:
+                renew()
                 made += _distill_batch(conn, group, origin, batch)
                 batch, size = [], 0
             batch.append(msgs)
             size += len(text) + 1
         if batch:
+            renew()
             made += _distill_batch(conn, group, origin, batch)
     return made
 
@@ -1185,8 +1204,8 @@ def cmd_ingest(args) -> None:
                 continue
             try:
                 claimed = conn.execute(
-                    "select collaude.claim_ingest(%s, make_interval(mins => %s), interval '30 minutes')",
-                    (cid, args.stale_after)).fetchone()[0]
+                    "select collaude.claim_ingest(%s, make_interval(mins => %s), make_interval(mins => %s))",
+                    (cid, args.stale_after, INGEST_LEASE_MINUTES)).fetchone()[0]
                 conn.commit()
             except psycopg.errors.InsufficientPrivilege as e:
                 conn.rollback()

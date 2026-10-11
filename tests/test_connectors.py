@@ -403,3 +403,29 @@ def test_a_thread_the_extractor_fails_on_is_retried_then_given_up(db, as_user, m
     with cl.connect(db["carol"]) as conn:
         assert conn.execute(state).fetchone() == (3, True)  # given up, so it no longer blocks the queue
     assert "extractor failed (3/3, giving up)" in (cl.STATE_DIR / "collaude.log").read_text()
+
+
+@needs_db
+def test_lease_is_renewed_and_a_lapsed_lease_stops_the_run(db, slack, as_user, monkeypatch):
+    as_user("alice")
+    monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+    cl.main(["connector", "add", "slack", "--name", "slack4", "--secret-env", "SLACK_TOKEN",
+             "--route", "#clump-rotation=g1"])
+    until = "select lease_until from collaude.connectors where id = 'slack4'"
+    with cl.connect(db["alice"]) as conn, cl.connect(db["admin"]) as admin:
+        assert conn.execute("select collaude.claim_ingest('slack4', interval '0', interval '1 minute')").fetchone()[0]
+        conn.commit()
+        before = conn.execute(until).fetchone()[0]
+        conn.commit()
+        cl._renew_lease(conn, "slack4")
+        assert conn.execute(until).fetchone()[0] > before + timedelta(minutes=20)
+        conn.commit()
+        admin.execute("update collaude.connectors set lease_until = now() - interval '1 second' where id = 'slack4'")
+        admin.commit()
+        with pytest.raises(cl.LeaseLost):
+            cl._renew_lease(conn, "slack4")
+        with cl.connect(db["carol"]) as other:  # someone else takes over; alice can't renew their lease
+            assert other.execute("select collaude.claim_ingest('slack4', interval '0', interval '1 minute')").fetchone()[0]
+            other.commit()
+        with pytest.raises(cl.LeaseLost):
+            cl._renew_lease(conn, "slack4")

@@ -153,7 +153,7 @@ collaude search --messages "zero point"      # search the raw messages
 1. Fetches new messages since the stored cursor. On the first run it goes back `--backfill-days`, 14 by default. Slack also re-checks the last 7 days for new replies to older threads.
 2. Redacts secrets and stores each message in `collaude.sources`. Re-fetching the same message never creates a duplicate.
 3. Waits until a thread has had no new messages for 2 hours (`--quiet-hours`), then sends it to Haiku together with up to 10 earlier, already-processed messages from the same thread as context. Haiku ignores chatter. Every memory must cite the IDs of the messages it came from; memories that don't are dropped.
-4. Processes at most 200 threads per run (`--max-threads`) and leaves the rest for the next session, so a long gap never turns into one huge run.
+4. Processes at most 200 threads per run (`--max-threads`) and leaves the rest for the next session, so a long gap never turns into one huge run. If extraction fails on a thread three times (for example, Haiku doesn't return JSON), that thread is skipped and logged so it can't hold up the others. A channel or folder that fails to fetch doesn't stop the connector's other channels; the error shows in `collaude connector list`.
 
 If nobody with credentials opens Claude for a while, nothing runs, and the next run catches up from the cursor. One exception: Slack's free plan hides messages older than 90 days. If you might go that long without opening Claude, add a cron or launchd job that runs `collaude ingest --stale-after 30 --quiet`.
 

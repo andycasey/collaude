@@ -273,10 +273,15 @@ def run_extractor(prompt: str) -> str:
 
 def parse_memories(raw: str, transcript: str, existing_ids: set[int],
                    allowed_source_ids: set[int] | None = None) -> list[dict]:
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError(f"extractor returned no JSON: {raw[:200]!r}")
-    items = json.loads(raw[start:end + 1]).get("memories") or []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:  # JSON wrapped in prose or a code fence
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError(f"extractor returned no JSON: {raw[:200]!r}") from None
+        data = json.loads(raw[start:end + 1])
+    items = data if isinstance(data, list) else data.get("memories") if isinstance(data, dict) else None
+    items = items if isinstance(items, list) else []
     norm_transcript = _norm(transcript)
     clean = []
     for m in items[:MAX_MEMORIES_PER_CAPTURE]:
@@ -290,6 +295,9 @@ def parse_memories(raw: str, transcript: str, existing_ids: set[int],
         # Keep the quote only if it really is verbatim; it is our provenance anchor.
         if not quote or _norm(quote) not in norm_transcript:
             quote = None
+        tags = m.get("tags") or []
+        if isinstance(tags, str):
+            tags = tags.split(",")
         sup = m.get("supersedes")
         try:
             sup = int(sup) if sup is not None else None
@@ -310,7 +318,7 @@ def parse_memories(raw: str, transcript: str, existing_ids: set[int],
             "title": title,
             "body": body,
             "kind": m.get("kind") if m.get("kind") in KINDS else "other",
-            "tags": [str(t).strip().lower()[:40] for t in (m.get("tags") or []) if str(t).strip()][:5],
+            "tags": [str(t).strip().lower()[:40] for t in tags if str(t).strip()][:5],
             "confidence": m.get("confidence") if m.get("confidence") in ("low", "medium", "high") else "medium",
             "evidence_quote": quote[:1000] if quote else None,
             "supersedes": sup if sup in existing_ids else None,

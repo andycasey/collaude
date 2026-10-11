@@ -251,3 +251,13 @@ print(json.dumps({{'memories': [{{'title': f'idle transactions: {{n}}', 'body': 
         titles = [r[0] for r in conn.execute("select title from collaude.memories where session_id = %s",
                                              (session_id,))]
     assert titles == ["idle transactions: 0"]
+
+
+def test_parse_memories_tolerates_odd_shapes():
+    one = {"title": "Momentum dumps cause 13.7 d dip", "body": "Mask them.", "kind": "gotcha"}
+    out = cl.parse_memories(json.dumps([{**one, "tags": "TESS, systematics"}, one]), "", set())
+    assert len(out) == 2 and out[0]["tags"] == ["tess", "systematics"]
+    assert cl.parse_memories("```json\n" + json.dumps({"memories": [one]}) + "\n```", "", set())[0]["kind"] == "gotcha"
+    assert cl.parse_memories('{"memories": {"title": "not a list"}}', "", set()) == []
+    with pytest.raises(ValueError):
+        cl.parse_memories("I can't help with that.", "", set())

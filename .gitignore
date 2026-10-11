@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+.venv/
+# Schema migrations are source code (overrides global *.sql ignores)
+!*.sql

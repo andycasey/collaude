@@ -73,7 +73,7 @@ Don't add the `collaude` schema to Supabase's exposed API schemas. Nothing here 
 1. Install [uv](https://docs.astral.sh/uv/).
 2. Install the plugin in Claude Code:
    ```
-   /plugin marketplace add <github-org>/collaude
+   /plugin marketplace add andycasey/collaude
    /plugin install collaude@collaude
    ```
 3. Save your connection string (stored in `~/.config/collaude/config.json`, mode 600):

@@ -371,3 +371,35 @@ def test_one_failing_route_does_not_stop_the_others(db, slack, as_user, monkeypa
     assert "#aaa-kicked: ConnectorError: Slack conversations.history: not_in_channel" in out
     cl.main(["connector", "list"])
     assert "ERROR: #aaa-kicked: ConnectorError" in capsys.readouterr().out
+
+
+@needs_db
+def test_a_thread_the_extractor_fails_on_is_retried_then_given_up(db, as_user, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cc.imaplib, "IMAP4_SSL", FakeImap)
+    FakeImap.mailbox = {"lists/stars": {
+        1: make_mail(201, "good", "Result: the asteroseismic masses agree with the eclipsing binaries to 2%.", days_ago=4),
+        2: make_mail(202, "bad", "POISON this thread makes the extractor reply with something that is not JSON.",
+                     days_ago=3),
+        3: make_mail(203, "also good", "Result: the red clump luminosity calibration shifts by 0.03 mag.", days_ago=2)}}
+    as_user("carol")
+    fake = tmp_path / "flaky_extractor.py"
+    fake.write_text("import sys\nprompt = sys.stdin.read()\n"
+                    "if 'POISON' in prompt:\n    print('Sorry, I cannot help with that.')\n"
+                    f"else:\n    sys.stdin = __import__('io').StringIO(prompt)\n    exec({FAKE_EXTRACTOR!r})\n")
+    monkeypatch.setenv("COLLAUDE_EXTRACT_CMD", f"{sys.executable} {fake}")
+    monkeypatch.setenv("MAILPW", "app-pass")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    cl.main(["connector", "add", "email", "--name", "flaky", "--host", "imap.example.org", "--user", "bot",
+             "--secret-env", "MAILPW", "--route", "lists/stars=g2"])
+    capsys.readouterr()
+    cl.main(["ingest", "flaky"])  # the two good threads get through despite sharing a batch with the bad one
+    assert "flaky: 3 new messages, 2 new memories" in capsys.readouterr().out
+    state = "select distill_failures, distilled_at is not null from collaude.sources where subject = 'bad' " \
+            "and connector_id = 'flaky'"
+    with cl.connect(db["carol"]) as conn:
+        assert conn.execute(state).fetchone() == (1, False)
+    cl.main(["ingest", "flaky"])
+    cl.main(["ingest", "flaky"])
+    with cl.connect(db["carol"]) as conn:
+        assert conn.execute(state).fetchone() == (3, True)  # given up, so it no longer blocks the queue
+    assert "extractor failed (3/3, giving up)" in (cl.STATE_DIR / "collaude.log").read_text()

@@ -51,6 +51,7 @@ MAX_MEMORIES_PER_CAPTURE = 5
 INGEST_STALE_MINUTES = int(os.environ.get("COLLAUDE_INGEST_STALE_MINUTES", "30"))
 INGEST_MAX_THREADS = 200
 INGEST_QUIET_HOURS = 2.0
+DISTILL_MAX_FAILURES = 3
 
 
 # --- configuration -----------------------------------------------------------
@@ -1144,8 +1145,22 @@ def _distill_batch(conn, group: str, origin: str, batch: list[list[dict]]) -> in
     if sum(len(m["content"]) for m in new.values()) >= 40:  # skip batches that are only "thanks!"
         existing = fetch_recent(conn, [group], 80)
         conn.commit()  # don't hold a transaction open while the extractor runs
-        raw = run_extractor(build_prompt(text, existing, group, MESSAGES_PROMPT_FILE))
-        memories = parse_memories(raw, text, {m["id"] for m in existing}, set(new))
+        try:
+            raw = run_extractor(build_prompt(text, existing, group, MESSAGES_PROMPT_FILE))
+            memories = parse_memories(raw, text, {m["id"] for m in existing}, set(new))
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+            if len(batch) > 1:  # find the thread that fails; let the others through
+                return sum(_distill_batch(conn, group, origin, [msgs]) for msgs in batch)
+            failures = conn.execute("""
+                update collaude.sources set distill_failures = distill_failures + 1,
+                       distilled_at = case when distill_failures + 1 >= %s then now() end
+                where id = any(%s) returning distill_failures""",
+                (DISTILL_MAX_FAILURES, list(new))).fetchone()[0]
+            conn.commit()
+            gave_up = ", giving up" if failures >= DISTILL_MAX_FAILURES else ""
+            log(f"distill {batch[0][0]['container']} thread {batch[0][0]['thread_key']}: extractor failed "
+                f"({failures}/{DISTILL_MAX_FAILURES}{gave_up}): {str(e)[:300]}")
+            return 0
     for m in memories:
         when = max(new[sid]["source_time"] for sid in m["source_ids"])
         insert_memory(conn, group, m, None, origin, EXTRACTOR_ID, when)

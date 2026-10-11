@@ -736,3 +736,42 @@ def test_github_end_to_end(db, github, as_user, monkeypatch, capsys):
         assert len(mems) == 2  # one per thread with something to say; the bot PR has nothing
         hits = cl.search_sources(conn, "zero-point offset", None)
         assert hits and hits[0]["container"] == FakeGitHub.repo
+
+
+@needs_db
+def test_rename_connector(db, slack, as_user, monkeypatch, capsys):
+    as_user("alice")
+    monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+    cl.main(["connector", "add", "slack", "--name", "lab", "--secret-env", "SLACK_TOKEN",
+             "--route", "#clump-rotation=g1"])
+    cl.main(["ingest", "lab"])
+    capsys.readouterr()
+
+    as_user("carol")  # in g1, but not the creator
+    with pytest.raises(SystemExit, match="only the creator"):
+        cl.main(["connector", "rename", "lab", "stars-slack"])
+    as_user("alice")
+    with pytest.raises(SystemExit, match="lowercase"):
+        cl.main(["connector", "rename", "lab", "Stars Slack"])
+    with cl.connect(db["alice"]) as conn:  # a run in progress blocks the rename
+        assert conn.execute("select collaude.claim_ingest('lab', interval '0', interval '5 minutes')").fetchone()[0]
+        conn.commit()
+        with pytest.raises(SystemExit, match="is running"):
+            cl.main(["connector", "rename", "lab", "stars-slack"])
+        conn.execute("select collaude.finish_ingest('lab', null)")
+        conn.commit()
+
+    cl.main(["connector", "rename", "lab", "stars-slack"])
+    assert "Renamed 'lab' to 'stars-slack'" in capsys.readouterr().out
+    assert json.loads(cl.SECRETS_FILE.read_text()) == {"stars-slack": "xoxb-test"}
+    with cl.connect(db["alice"]) as conn:
+        assert conn.execute("select count(*) from collaude.sources where connector_id = 'stars-slack'").fetchone()[0] == 3
+        assert conn.execute("select count(*) from collaude.connector_routes "
+                            "where connector_id = 'stars-slack'").fetchone()[0] == 1
+        assert not conn.execute("select 1 from collaude.connectors where id = 'lab'").fetchall()
+
+    # Another machine still holds the credentials under the old name: its next ingest adopts them.
+    cl.SECRETS_FILE.write_text(json.dumps({"lab": "xoxb-test"}))
+    cl.main(["ingest", "--max-threads", "0"])
+    assert "stars-slack:" in capsys.readouterr().out
+    assert json.loads(cl.SECRETS_FILE.read_text()) == {"stars-slack": "xoxb-test"}

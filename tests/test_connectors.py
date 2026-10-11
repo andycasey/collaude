@@ -28,6 +28,9 @@ class FakeSlack:
     def __init__(self):
         t0 = NOW - 3 * DAY
         self.users = {"U1": "Alice Astro", "U2": "Bob Bolometer"}
+        self.channels = [{"id": "C0STARS1", "name": "clump-rotation", "is_member": True},
+                         {"id": "C0OTHER1", "name": "random", "is_member": False}]
+        self.broken = set()  # channels whose history calls fail
         self.history = {"C0STARS1": [
             {"ts": f"{t0:.6f}", "user": "U1", "text": "Gaia DR3 parallaxes for the clump sample need the "
              "Lindegren zero-point correction, otherwise distances come out 3% too large.",
@@ -50,12 +53,13 @@ class FakeSlack:
             return {"ok": True, "team": "Flatiron Test", "team_id": "T1", "url": "https://fi-test.slack.com/",
                     "user": "collaude"}
         if method == "conversations.list":
-            return {"ok": True, "channels": [{"id": "C0STARS1", "name": "clump-rotation", "is_member": True},
-                                             {"id": "C0OTHER1", "name": "random", "is_member": False}]}
+            return {"ok": True, "channels": self.channels}
         if method == "conversations.info":
             return {"ok": True, "channel": {"id": q["channel"], "name": "clump-rotation"}}
         if method == "users.info":
             return {"ok": True, "user": {"name": q["user"], "profile": {"real_name": self.users[q["user"]]}}}
+        if q.get("channel") in self.broken:
+            return {"ok": False, "error": "not_in_channel"}
         msgs = self.history.get(q.get("channel"), [])
         oldest = float(q.get("oldest", 0))
         if method == "conversations.history":  # top-level messages and thread parents only
@@ -350,3 +354,20 @@ def test_email_connector_and_distill_cap(db, as_user, monkeypatch, capsys):
     assert "lists" not in json.loads(cl.SECRETS_FILE.read_text())
     with cl.connect(db["bob"]) as conn:  # history kept
         assert len(cl.search_sources(conn, "spectroscopic", ["g2"])) == 3
+
+
+@needs_db
+def test_one_failing_route_does_not_stop_the_others(db, slack, as_user, monkeypatch, capsys):
+    slack.channels.append({"id": "C0GONE01", "name": "aaa-kicked", "is_member": True})
+    as_user("alice")
+    monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+    cl.main(["connector", "add", "slack", "--name", "slack3", "--secret-env", "SLACK_TOKEN",
+             "--route", "#aaa-kicked=g1", "--route", "#clump-rotation=g1"])
+    slack.broken.add("C0GONE01")  # e.g. the bot was removed from the channel
+    capsys.readouterr()
+    cl.main(["ingest", "slack3"])
+    out = capsys.readouterr().out
+    assert "slack3: 3 new messages, 1 new memories; 1 of 2 sources failed" in out
+    assert "#aaa-kicked: ConnectorError: Slack conversations.history: not_in_channel" in out
+    cl.main(["connector", "list"])
+    assert "ERROR: #aaa-kicked: ConnectorError" in capsys.readouterr().out

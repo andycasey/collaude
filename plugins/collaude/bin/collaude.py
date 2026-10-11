@@ -1042,15 +1042,21 @@ def cmd_slack_manifest(_args) -> None:
     print(json.dumps(_connectors_mod().SLACK_MANIFEST, indent=2))
 
 
-def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int) -> str:
+def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max_threads: int) -> tuple[str, str | None]:
+    """Fetch every route, then distil. Returns (summary, error); one failing route doesn't stop the rest."""
     impl = _connectors_mod().make(kind, settings, secret)
     routes = conn.execute("""select source_key, source_label, group_id, cursor, backfill_from
                              from collaude.connector_routes where connector_id = %s order by source_key""",
                           (cid,)).fetchall()
     conn.commit()  # end the read before talking to the remote service
-    fetched = 0
+    fetched, errors = 0, []
     for key, label, group, cursor, backfill in routes:
-        items, new_cursor = impl.fetch(key, cursor, backfill, label)
+        try:
+            items, new_cursor = impl.fetch(key, cursor, backfill, label)
+        except Exception as e:
+            conn.rollback()
+            errors.append(f"{label or key}: {type(e).__name__}: {e}")
+            continue
         for it in items:
             cur = conn.execute("""
                 insert into collaude.sources
@@ -1066,7 +1072,10 @@ def ingest_connector(conn, cid: str, kind: str, settings: dict, secret: str, max
                         where connector_id = %s and source_key = %s""", (new_cursor, cid, key))
         conn.commit()
     made = distill(conn, cid, impl.origin, float(settings.get("quiet_hours", INGEST_QUIET_HOURS)), max_threads)
-    return f"{fetched} new messages, {made} new memories"
+    summary = f"{fetched} new messages, {made} new memories"
+    if errors:
+        summary += f"; {len(errors)} of {len(routes)} sources failed"
+    return summary, "; ".join(errors)[:500] or None
 
 
 def _render_thread(msgs: list[dict]) -> str:
@@ -1174,7 +1183,9 @@ def cmd_ingest(args) -> None:
                 continue
             error = None
             try:
-                summary = ingest_connector(conn, cid, kind, settings, held[cid], args.max_threads)
+                summary, error = ingest_connector(conn, cid, kind, settings, held[cid], args.max_threads)
+                if error:
+                    summary += f" ({error})"
             except Exception as e:
                 conn.rollback()
                 error = f"{type(e).__name__}: {e}"[:500]

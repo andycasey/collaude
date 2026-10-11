@@ -208,6 +208,12 @@ def condense_transcript(lines: list[str]) -> str:
     return "\n".join(out)
 
 
+def _is_injected(entry: dict) -> bool:
+    """Entries Claude Code writes as user turns that the user did not type: loaded skills,
+    command output, and compaction summaries."""
+    return bool(entry.get("isMeta") or entry.get("isCompactSummary") or entry.get("isVisibleInTranscriptOnly"))
+
+
 def is_off_record(lines: list[str]) -> bool:
     for raw in lines:
         if OFF_RECORD not in raw:
@@ -216,7 +222,7 @@ def is_off_record(lines: list[str]) -> bool:
             entry = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if entry.get("type") != "user":
+        if entry.get("type") != "user" or _is_injected(entry):
             continue
         content = (entry.get("message") or {}).get("content")
         if isinstance(content, str):

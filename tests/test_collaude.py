@@ -67,6 +67,10 @@ def test_off_record():
     assert cl.is_off_record(TRANSCRIPT + [entry("user", "this is #offrecord please")])
     # A mention inside tool output does not count.
     assert not cl.is_off_record(TRANSCRIPT + [entry("user", [{"type": "tool_result", "content": "#offrecord"}])])
+    # Nor does text Claude Code injects as a user turn: a loaded skill or a compaction summary.
+    assert not cl.is_off_record(TRANSCRIPT + [entry("user", [{"type": "text", "text": "write #offrecord"}], isMeta=True)])
+    assert not cl.is_off_record(TRANSCRIPT + [entry("user", "Summary: #offrecord skips capture",
+                                                    isCompactSummary=True, isVisibleInTranscriptOnly=True)])
 
 
 def test_find_project(tmp_path):

@@ -845,6 +845,13 @@ To create the Slack app (once per workspace):
   3. In each channel you want to share, type: /invite @collaude
 """
 
+GITHUB_SETUP = """\
+GitHub needs a token that can read issues and pull requests:
+  - Press Enter to use your `gh` login (it is asked for a fresh token each run), or
+  - create a fine-grained token at https://github.com/settings/personal-access-tokens/new
+    with read-only "Issues" and "Pull requests" access to the repos you want to share.
+"""
+
 
 def _connectors_mod():
     if str(SCRIPT.parent) not in sys.path:
@@ -862,7 +869,8 @@ def _whoami(conn) -> str:
     return conn.execute("select session_user").fetchone()[0]
 
 
-def _read_secret(args, prompt: str) -> str:
+def _read_secret(args, prompt: str, empty: str | None = None) -> str:
+    """The token or password, from --secret-env or a prompt. `empty` is what pressing Enter means."""
     if getattr(args, "secret_env", None):
         value = os.environ.get(args.secret_env)
         if not value:
@@ -870,7 +878,7 @@ def _read_secret(args, prompt: str) -> str:
         return value
     if not sys.stdin.isatty():
         sys.exit("collaude: no terminal to prompt on; pass --secret-env VAR")
-    value = getpass.getpass(f"{prompt}: ").strip()
+    value = getpass.getpass(f"{prompt}: ").strip() or empty
     if not value:
         sys.exit("collaude: nothing entered")
     return value
@@ -949,6 +957,17 @@ def _ask_routes(impl, groups: list[str]) -> list[tuple[str, str]]:
     if not sources:
         print("  The credentials can't see any channels or folders yet.")
         return []
+    if len(sources) > 25:  # e.g. every repo a GitHub account can see: ask by name instead
+        print(f"The credentials can see {len(sources)} sources (`collaude connector sources <name>` lists them).")
+        print(f"Enter SOURCE=GROUP, one per line, then an empty line. Your groups: {', '.join(groups)}.")
+        pairs = []
+        while answer := input("  ").strip():
+            src, sep, group = answer.rpartition("=")
+            if sep and src and group:
+                pairs.append((src.strip(), group.strip()))
+            else:
+                print("  expected SOURCE=GROUP, e.g. owner/repo=my-group")
+        return pairs
     print(f"Which group should each one feed? Your groups: {', '.join(groups)}. Press Enter to skip.")
     pairs = []
     for key, label in sources:
@@ -988,7 +1007,10 @@ def cmd_connector_add(args) -> None:
         settings["quiet_hours"] = args.quiet_hours
     if kind == "slack" and not args.secret_env:
         print(SLACK_SETUP)
-    secret = _oauth_login(args, cid, args.user) if oauth else _read_secret(args, cc.KINDS[kind].secret_prompt)
+    if kind == "github" and not args.secret_env:
+        print(GITHUB_SETUP)
+    empty = "gh" if kind == "github" else None
+    secret = _oauth_login(args, cid, args.user) if oauth else _read_secret(args, cc.KINDS[kind].secret_prompt, empty)
     impl = cc.make(kind, settings, secret)
     try:
         settings.update(impl.check())
@@ -1050,7 +1072,7 @@ def cmd_connector_login(args) -> None:
     if settings.get("auth") == "oauth":
         secret = _oauth_login(args, args.name, settings["user"])
     else:
-        secret = _read_secret(args, cc.KINDS[kind].secret_prompt)
+        secret = _read_secret(args, cc.KINDS[kind].secret_prompt, "gh" if kind == "github" else None)
     impl = cc.make(kind, settings, secret)
     try:
         impl.check()
@@ -1538,7 +1560,7 @@ def main(argv=None) -> None:
                     help="threads to distil per run; the rest wait for the next run")
     sp.add_argument("--quiet", action="store_true")
 
-    sp = add("connector", None, "add and manage Slack/email connectors")
+    sp = add("connector", None, "add and manage Slack, email and GitHub connectors")
     csub = sp.add_subparsers(dest="connector_cmd", required=True)
 
     def secret_opt(a):
@@ -1554,8 +1576,8 @@ def main(argv=None) -> None:
     def backfill_opt(a):
         a.add_argument("--backfill-days", type=int, default=14, help="history to ingest on first run (default 14)")
 
-    a = csub.add_parser("add", help="connect a Slack workspace or a mailbox (prompts for what it needs)")
-    a.add_argument("kind", choices=("slack", "email", "imap"), help="email and imap are the same thing")
+    a = csub.add_parser("add", help="connect a Slack workspace, a mailbox or GitHub (prompts for what it needs)")
+    a.add_argument("kind", choices=("slack", "email", "imap", "github"), help="email and imap are the same thing")
     a.add_argument("--name", help="connector name (default: the kind)")
     a.add_argument("--host", help="IMAP server, e.g. imap.gmail.com (the default with --oauth)")
     a.add_argument("--user", help="IMAP login, e.g. lists-bot@example.org")
@@ -1564,15 +1586,16 @@ def main(argv=None) -> None:
                    help="sign in to Gmail or Google Workspace in the browser instead of using a password")
     oauth_opt(a)
     a.add_argument("--route", action="append", metavar="SOURCE=GROUP",
-                   help="'#channel=group' or 'folder=group'; repeatable. Without it you are asked per channel/folder")
+                   help="'#channel=group', 'folder=group' or 'owner/repo=group'; repeatable. "
+                        "Without it you are asked")
     a.add_argument("--quiet-hours", type=float, help=f"wait this long after a thread's last message before "
                                                      f"distilling it (default {INGEST_QUIET_HOURS:g})")
     secret_opt(a)
     backfill_opt(a)
     a.set_defaults(fn=cmd_connector_add)
-    a = csub.add_parser("route", help="feed a channel or folder into a group")
+    a = csub.add_parser("route", help="feed a channel, folder or repo into a group")
     a.add_argument("name")
-    a.add_argument("source", help="'#channel', channel id, or mail folder")
+    a.add_argument("source", help="'#channel', channel id, mail folder, or owner/repo")
     a.add_argument("group")
     backfill_opt(a)
     a.set_defaults(fn=cmd_connector_route)

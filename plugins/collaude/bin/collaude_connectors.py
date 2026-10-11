@@ -15,14 +15,21 @@ author_handle, source_time, permalink, subject, content.
 
 from __future__ import annotations
 
+import base64
 import email
 import email.policy
 import email.utils
+import hashlib
 import html
 import imaplib
 import json
 import re
+import secrets
+import select
+import sys
+import threading
 import time
+import webbrowser
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -251,6 +258,156 @@ def parse_email(raw: bytes, folder: str, fallback_id: str, web_link: str | None 
     }
 
 
+# --- Google OAuth (XOAUTH2 for IMAP) -------------------------------------------------
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_SCOPE = "https://mail.google.com/"
+
+
+def oauth_client_from_file(path) -> tuple[str, str]:
+    """(client_id, client_secret) from the JSON that Google Cloud Console downloads for an OAuth client."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ConnectorError(f"cannot read OAuth client file {path}: {e}") from e
+    client = data.get("installed") or data.get("web") or data
+    if not client.get("client_id") or not client.get("client_secret"):
+        raise ConnectorError(f"{path} has no client_id and client_secret; download the JSON of a "
+                             f"Desktop app OAuth client")
+    return client["client_id"], client["client_secret"]
+
+
+def _token_request(params: dict) -> dict:
+    req = urllib.request.Request(GOOGLE_TOKEN_URL, data=urllib.parse.urlencode(params).encode(),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.load(e)
+        except ValueError:
+            body = {}
+        detail = f" ({body['error_description']})" if body.get("error_description") else ""
+        raise ConnectorError(f"Google token request failed: {body.get('error') or f'HTTP {e.code}'}{detail}") from e
+    except OSError as e:
+        raise ConnectorError(f"Google token request failed: {e}") from e
+
+
+def _pkce() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def _code_from_redirect(url: str, state: str) -> str:
+    """The authorization code in a redirect URL, after checking its state. A bare code is returned as is."""
+    url = url.strip()
+    if "code=" not in url and "error=" not in url:
+        return url
+    query = urllib.parse.parse_qs(url.split("?", 1)[-1])
+    if "error" in query:
+        raise ConnectorError(f"Google sign-in failed: {query['error'][0]}")
+    if query.get("state", [None])[0] != state:
+        raise ConnectorError("Google sign-in failed: the reply's state doesn't match this sign-in")
+    return query["code"][0]
+
+
+def _wait_for_code(state: str, got: dict, done: threading.Event, timeout: float) -> str:
+    """Wait for the browser to hit the loopback server, or for the user to paste the address it reached."""
+    deadline = time.time() + timeout
+    while not done.is_set():
+        if time.time() > deadline:
+            raise ConnectorError("Google sign-in timed out")
+        if sys.stdin.isatty() and select.select([sys.stdin], [], [], 0.5)[0]:
+            line = sys.stdin.readline()
+            if line.strip():
+                return _code_from_redirect(line, state)
+        else:
+            done.wait(0.5)
+    if "error" in got:
+        raise got["error"]
+    return got["code"]
+
+
+def oauth_authorize(client_id: str, client_secret: str, login_hint: str | None = None,
+                    timeout: float = 600, open_browser: bool = True) -> str:
+    """Run Google's installed-app sign-in (loopback redirect with PKCE) and return a refresh token.
+
+    The sign-in address is printed as well as opened, so this works over SSH: open it in
+    any browser, and if that browser can't reach this machine, paste the address it ends
+    up on (http://127.0.0.1:...) back at the prompt.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    state = secrets.token_urlsafe(24)
+    verifier, challenge = _pkce()
+    got: dict = {}
+    done = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if "code=" not in self.path and "error=" not in self.path:
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                got["code"] = _code_from_redirect(self.path, state)
+                msg = "collaude is connected. You can close this tab."
+            except ConnectorError as e:
+                got["error"] = e
+                msg = f"collaude: {e}"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(msg.encode())
+            done.set()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    redirect_uri = f"http://127.0.0.1:{server.server_port}"
+    params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": GMAIL_SCOPE,
+              "state": state, "code_challenge": challenge, "code_challenge_method": "S256",
+              "access_type": "offline", "prompt": "consent"}
+    if login_hint:
+        params["login_hint"] = login_hint
+    url = f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        print(f"Sign in to Google to let collaude read this mailbox:\n\n  {url}\n")
+        if open_browser:
+            webbrowser.open(url)
+        print("Waiting for the browser. If it's on another machine, paste the address it ends up on "
+              "(starting http://127.0.0.1) here and press Enter.", flush=True)
+        code = _wait_for_code(state, got, done, timeout)
+    finally:
+        server.shutdown()
+        server.server_close()
+    tokens = _token_request({"code": code, "client_id": client_id, "client_secret": client_secret,
+                             "redirect_uri": redirect_uri, "grant_type": "authorization_code",
+                             "code_verifier": verifier})
+    if not tokens.get("refresh_token"):
+        raise ConnectorError("Google didn't return a refresh token; remove collaude's access at "
+                             "https://myaccount.google.com/permissions and try again")
+    return tokens["refresh_token"]
+
+
+def oauth_secret(client_id: str, client_secret: str, refresh_token: str) -> str:
+    """What secrets.json holds for a mailbox that signs in with OAuth."""
+    return json.dumps({"client_id": client_id, "client_secret": client_secret, "refresh_token": refresh_token})
+
+
+def xoauth2_string(user: str, access_token: str) -> str:
+    return f"user={user}\1auth=Bearer {access_token}\1\1"
+
+
+# --- IMAP ----------------------------------------------------------------------------
+
+
 class ImapConnector:
     kind = "imap"
     origin = "email"
@@ -258,12 +415,32 @@ class ImapConnector:
 
     def __init__(self, settings: dict, secret: str):
         self.settings = settings
-        self.password = secret
+        self.oauth = json.loads(secret) if settings.get("auth") == "oauth" else None
+        self.password = None if self.oauth else secret
+        self._access: tuple[str, float] | None = None  # (token, expiry)
+
+    def _access_token(self) -> str:
+        if self._access and time.time() < self._access[1] - 60:
+            return self._access[0]
+        try:
+            tokens = _token_request({"client_id": self.oauth["client_id"], "client_secret": self.oauth["client_secret"],
+                                     "refresh_token": self.oauth["refresh_token"], "grant_type": "refresh_token"})
+        except ConnectorError as e:
+            if "invalid_grant" in str(e):
+                raise ConnectorError(f"Google no longer accepts the saved sign-in for {self.settings.get('user')} "
+                                     f"(revoked or expired); run `collaude connector login <name>` again") from e
+            raise
+        self._access = (tokens["access_token"], time.time() + float(tokens.get("expires_in", 3600)))
+        return self._access[0]
 
     def _open(self):
         try:
             box = imaplib.IMAP4_SSL(self.settings["host"], int(self.settings.get("port", 993)), timeout=60)
-            box.login(self.settings["user"], self.password)
+            if self.oauth:
+                auth = xoauth2_string(self.settings["user"], self._access_token())
+                box.authenticate("XOAUTH2", lambda _: auth.encode())
+            else:
+                box.login(self.settings["user"], self.password)
         except (OSError, imaplib.IMAP4.error) as e:
             raise ConnectorError(f"IMAP login to {self.settings.get('host')} failed: {e}") from e
         return box

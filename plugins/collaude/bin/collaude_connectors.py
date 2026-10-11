@@ -635,7 +635,7 @@ class GitHubConnector:
         # thread with new comments. Re-fetched posts are dropped as duplicates.
         for it in self._paged(f"/repos/{source_key}/issues", state="all", since=start, sort="updated",
                               direction="asc"):
-            kind = "PR" if it.get("pull_request") else "Issue"
+            kind = "PR" if "pull_request" in it else "Issue"
             titles[it["number"]] = f"{kind} #{it['number']}: {it['title']}"
             body = self._clean(it.get("body"))
             if x := self._item(source_key, label, it["number"], f"issue{it['id']}", it,
